@@ -133,8 +133,7 @@ try:
 except:
     print('CUDA extension not installed.')
 
-# Assumes layer is perfectly divisible into 1024 * 1024 blocks
-class Quant3Linear(nn.Module): 
+class Quant3Linear(nn.Module):
 
     def __init__(self, infeatures, outfeatures, faster=False):
         super().__init__()
@@ -181,23 +180,32 @@ class Quant3Linear(nn.Module):
             row += 1
 
         qweight = qweight.astype(np.int32)
-        self.qweight = torch.from_numpy(qweight) 
+        self.qweight = torch.from_numpy(qweight)
 
     def forward(self, x):
-        if x.shape[-1] == x.numel():
-            outshape = list(x.shape)
-            y = self.bias.clone()
-            outshape[-1] = self.bias.numel()
-            dtype = x.dtype
-            if self.faster:
-                x = x.half()
-                quant_cuda.vecquant3matmul_faster(x, self.qweight, y, self.scales, self.zeros)
-            else:
-                x = x.float()
-                quant_cuda.vecquant3matmul(x, self.qweight, y, self.scales, self.zeros)
-            y = y.to(dtype)
-            return y.reshape(outshape)
-        raise ValueError('Only supports a single token currently.')
+        outshape = list(x.shape)
+        outshape[-1] = self.bias.numel()
+        y = torch.zeros(outshape, device=x.device, dtype=torch.float32)
+
+        dtype = x.dtype
+        x_flat = x.reshape(-1, x.shape[-1])
+        y_flat = y.reshape(-1, y.shape[-1])
+
+        if self.faster:
+            if x_flat.dtype != torch.half:
+                x_flat = x_flat.half()
+            quant_cuda.vecquant3matmul_faster(x_flat, self.qweight, y_flat, self.scales.float(), self.zeros.float())
+        else:
+            if x_flat.dtype != torch.float:
+                 x_flat = x_flat.float()
+            quant_cuda.vecquant3matmul(x_flat, self.qweight, y_flat, self.scales.float(), self.zeros.float())
+
+        y = y_flat.reshape(outshape)
+        if self.bias is not None:
+            y += self.bias.to(y.dtype)
+
+        y = y.to(dtype)
+        return y
 
 def make_quant3(module, names, name='', faster=False):
     if isinstance(module, Quant3Linear):
@@ -206,8 +214,9 @@ def make_quant3(module, names, name='', faster=False):
         tmp = getattr(module, attr)
         name1 = name + '.' + attr if name != '' else attr
         if name1 in names:
-            setattr(
-                module, attr, Quant3Linear(tmp.in_features, tmp.out_features, faster=faster)
-            )
+            if isinstance(tmp, nn.Linear):
+                setattr(
+                    module, attr, Quant3Linear(tmp.in_features, tmp.out_features, faster=faster)
+                )
     for name1, child in module.named_children():
         make_quant3(child, names, name + '.' + name1 if name != '' else name1, faster=faster)
