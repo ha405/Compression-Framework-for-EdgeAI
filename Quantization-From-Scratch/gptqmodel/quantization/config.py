@@ -216,6 +216,9 @@ class QuantizeConfig():
     v2_alpha: float = 0.25
     v2_memory_device: str = "auto" #
 
+    beta: float = field(default=0.0, metadata={"help": "Strength of KL divergence term (beta=0 recovers vanilla GPTQ)"})
+    tau: float = field(default=1.0, metadata={"help": "Temperature for softmax in KL divergence calculation (must be > 0)"})
+
     def __post_init__(self):
         fields_info = fields(self)
 
@@ -286,6 +289,11 @@ class QuantizeConfig():
 
         # adapter normalize
         self.adapter = normalize_adapter(self.adapter)
+
+        if self.beta < 0:
+            raise ValueError("QuantizeConfig: `beta` must be non-negative (>= 0).")
+        if self.tau <= 0:
+            raise ValueError("QuantizeConfig: `tau` (temperature) must be positive (> 0).")
 
         #print(f"adapter: {self.adapter}")
 
@@ -469,6 +477,8 @@ class QuantizeConfig():
             META_FIELD: self.meta,
             # DO NOT EXPORT Adapter to config/json since adapter can be swapped out/in
             # ADAPTER_FIELD: self.adapter.to_dict() if self.adapter else None,
+            "beta": self.beta,
+            "tau": self.tau,
         }
 
         dynamic = out["dynamic"]
