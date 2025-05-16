@@ -28,7 +28,7 @@ The KLAWQ logic is integrated into a modified version of the `gptqmodel` library
         ```
 
 2.  **KL Hessian Approximation (`A`) Calculation:**
-    *   Implemented in `KLAWQ/gptqmodel/quantization/gptq.py` within the `GPTQ.process_batch` method.
+    *   Implemented in `KLAWQ/kl-aware-quant//quantization/gptq.py` within the `GPTQ.process_batch` method.
     *   When `qcfg.beta > 0`, this section computes an approximation of the Hessian related to the KL divergence term. It uses the current layer's full-precision weights (`self.W_orig`) to get outputs, calculates soft probabilities (`pt`) using the configured `tau`, and then forms the matrix `A` (Equation 7 in the paper, with some approximations).
         ```python
         # Snippet from GPTQ.process_batch:
@@ -45,7 +45,7 @@ The KLAWQ logic is integrated into a modified version of the `gptqmodel` library
         ```
 
 3.  **Combined Hessian (`H_tot`):**
-    *   Formed in `KLAWQ/gptqmodel/quantization/gptq.py` at the beginning of the `GPTQ.quantize` method.
+    *   Formed in `KLAWQ/kl-aware-quant/quantization/gptq.py` at the beginning of the `GPTQ.quantize` method.
     *   The standard Hessian `H` (from reconstruction error) and the KL Hessian `A` are combined:
         ```python
         # Snippet from GPTQ.quantize:
@@ -68,8 +68,8 @@ The KLAWQ logic is integrated into a modified version of the `gptqmodel` library
 The repository `Compression-Framework-for-EdgeAI` contains the KLAWQ project.
 
 *   `Compression-Framework-for-EdgeAI/` (Repository Root)
-    *   `KLAWQ/Kl-aware-quant`
-        *   `gptqmodel/`: This directory contains the modified `gptqmodel` library where KLAWQ is integrated.
+    *   `KLAWQ`
+        *   `Kl-aware-quant/`: This directory contains the modified `gptqmodel` library where KLAWQ is integrated.
             *   `quantization/`
                 *   `config.py`: Defines the `QuantizeConfig` class, extended to include KLAWQ's `beta` and `tau` hyperparameters.
                 *   `gptq.py`: Implements the core KLAWQ algorithm modifications within the GPTQ framework. This includes the KL Hessian (`A`) calculation, the combination `H_tot = H + βA`, and the subsequent use of this modified Hessian in the quantization process.
