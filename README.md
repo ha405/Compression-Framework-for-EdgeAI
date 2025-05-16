@@ -68,7 +68,7 @@ The KLAWQ logic is integrated into a modified version of the `gptqmodel` library
 The repository `Compression-Framework-for-EdgeAI` contains the KLAWQ project.
 
 *   `Compression-Framework-for-EdgeAI/` (Repository Root)
-    *   `KLAWQ/`
+    *   `KLAWQ/Kl-aware-quant`
         *   `gptqmodel/`: This directory contains the modified `gptqmodel` library where KLAWQ is integrated.
             *   `quantization/`
                 *   `config.py`: Defines the `QuantizeConfig` class, extended to include KLAWQ's `beta` and `tau` hyperparameters.
