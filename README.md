@@ -78,6 +78,7 @@ The repository `Compression-Framework-for-EdgeAI` contains the KLAWQ project.
         *   `kl-hessian-gptq-analysis.ipynb`: A Jupyter notebook demonstrating KLAWQ quantization and evaluation on the GPT-2 model (text-based LLM). This serves as the primary example for understanding KLAWQ usage.
         *   `kl-hessian-gptq-main.ipynb`: A Jupyter notebook showcasing KLAWQ applied to a multi-modal model (Qwen-VL).
     *   `requirements.txt`: Lists necessary Python packages for the project.
+    *   The Root directory has a notebeook `klawq-detailed-analysis` that demonstrates all the testing and results of our implementation
 
 ## Setup
 
