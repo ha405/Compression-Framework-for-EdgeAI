@@ -15,12 +15,14 @@
 # limitations under the License.
 
 import gc as py_gc
-from typing import Callable, Union
+from typing import Callable, Optional, Union
 
 import torch
 from packaging.version import Version
 
+from ..models._const import DEVICE
 from ..utils.logger import setup_logger
+from . import BACKEND
 
 HAS_CUDA = False
 HAS_XPU = False
@@ -149,4 +151,44 @@ def auto_select_torch_device(index: int = 0):
     else:
         device = torch.device("cpu") # cpu has no index
 
+    return device
+
+def normalize_device(device: Union[str, torch.device, DEVICE]) -> DEVICE:
+    if isinstance(device, DEVICE):
+        return device
+    elif isinstance(device, torch.device):
+        return DEVICE(device.type)
+    elif isinstance(device, str):
+        device = device.lower()
+        if device in ["cuda", "gpu"]:
+            return DEVICE.CUDA
+        elif device in ["cpu"]:
+            return DEVICE.CPU
+        elif device in ["mps"]:
+            return DEVICE.MPS
+        elif device in ["xpu"]:
+            return DEVICE.XPU
+        else:
+            try:
+                return DEVICE(device)
+            except ValueError:
+                raise ValueError(f"Unknown device: {device}")
+    else:
+        raise ValueError(f"device must be a string or torch.device, got {type(device)}")
+
+def auto_select_device(device: Optional[DEVICE], backend: Optional[BACKEND]) -> DEVICE:
+    assert device is None or isinstance(device, DEVICE)
+    assert backend is None or isinstance(backend, BACKEND)
+
+    if device is None:
+        if backend == BACKEND.IPEX:
+            device = DEVICE.XPU if HAS_XPU else DEVICE.CPU
+        elif HAS_CUDA:
+            device = DEVICE.CUDA
+        elif HAS_XPU:
+            device = DEVICE.XPU
+        elif HAS_MPS:
+            device = DEVICE.MPS
+        else:
+            device = DEVICE.CPU
     return device
