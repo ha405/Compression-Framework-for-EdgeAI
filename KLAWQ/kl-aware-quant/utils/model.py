@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import collections
 import functools
 import hashlib
@@ -21,7 +20,7 @@ import torch.nn as nn
 import transformers
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from packaging import version
-from packaging.version import Version, InvalidVersion, PackageNotFoundError
+from packaging.version import Version, InvalidVersion
 from torch.nn.modules.conv import _ConvNd
 from transformers import PretrainedConfig, AutoConfig, AutoTokenizer
 from transformers.pytorch_utils import id_tensor_storage
@@ -81,10 +80,10 @@ def check_versions(model_class, requirements: List[str]):
     for req in requirements:
         pkg, operator, version_required = parse_requirement(req)
         try:
-            installed_version = version(pkg)
+            installed_version = importlib.metadata.version(pkg)
             if not compare_versions(installed_version, version_required, operator):
                 raise ValueError(f"{model_class} requires version {req}, but current {pkg} version is {installed_version} ")
-        except PackageNotFoundError:
+        except importlib.metadata.PackageNotFoundError:
             raise ValueError(f"{model_class} requires version {req}, but {pkg} not installed.")
 
 
