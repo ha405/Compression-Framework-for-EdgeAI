@@ -1,25 +1,10 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
-# Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 import copy
 import math
 import sys
 from typing import List, Optional, Tuple
 
 import numpy as np
-import torch as t  # conflict with torch.py
+import torch as t  
 import torch.nn as nn
 import transformers
 from torch.nn.modules.conv import _ConvNd
@@ -38,8 +23,6 @@ class BaseQuantLinear(nn.Module):
     SUPPORTS_SYM: List[bool] = None
     SUPPORTS_SHARDS: bool = None
     SUPPORTS_TRAINING: bool = None
-
-    # IPEX kernel will use Torch for training only and switches back to IPEX for eval/inference
     SUPPORTS_TRAINING_USE_TORCH_KERNEL: bool = False
 
     SUPPORTS_AUTO_PADDING: bool = None
@@ -72,7 +55,7 @@ class BaseQuantLinear(nn.Module):
         super().__init__()
         if name is None:
             name = f"{self.__class__.__module__}.{self.__class__.__qualname__}"
-        self.name = name # full path module name in model weights
+        self.name = name 
         self.in_features = in_features
         self.out_features = out_features
         self.group_size = group_size if group_size != -1 else in_features
@@ -82,16 +65,14 @@ class BaseQuantLinear(nn.Module):
         self.backend = backend
         self.maxq = 2 ** self.bits - 1
         self.pack_dtype = pack_dtype
-        # we need to clone the adapter since passed in adapter may be shared
-        # adapter tensors are lodaed inside adapter so they must be unique per module
         self.adapter =  copy.deepcopy(adapter)
 
         self.optimized = False
 
         if self.pack_dtype == t.int8:
             self.pack_dtype_bits = 8
-            self.pack_np_dtype = np.int8 # qweight saved dtype
-            self.pack_np_math_dtype = np.uint8 # pre-save math dtype
+            self.pack_np_dtype = np.int8 
+            self.pack_np_math_dtype = np.uint8 
         elif self.pack_dtype == t.int16:
             self.pack_dtype_bits = 16
             self.pack_np_dtype = np.int16
@@ -107,18 +88,14 @@ class BaseQuantLinear(nn.Module):
         else:
             raise ValueError("Unsupported weight_dtype. Only int16 and int32 are supported.")
 
-        # pack_factor is only used for bits 2, 4, and 8. bit3 3 does not use this variable.
         self.pack_factor = self.pack_dtype_bits // self.bits
         _, err = self._validate(bits=bits, group_size=group_size, desc_act=desc_act, sym=sym, in_features=in_features, out_features=out_features, pack_dtype=pack_dtype)
         if err:
             raise err
 
-        # store qzero format
-        self._qzeros_format = 1 # only valid values are 1 and 2 for GPTQ v1 GPTQ v2
+        self._qzeros_format = 1
 
-        # most kernels share same buffers so they can share same register buffer code
         if register_buffers:
-            # some kernels auto-pads in/out features
             in_features = self.in_features if not register_buffers_in_features else register_buffers_in_features
             out_features = self.out_features if not register_buffers_out_features else register_buffers_out_features
 
@@ -152,12 +129,10 @@ class BaseQuantLinear(nn.Module):
             else:
                 self.bias = None
 
-        # load adapter if any
         if adapter is not None:
             if adapter.path in LORA_MERGED_WEIGHT_PATHS:
                 print(f"Adapter (merged weights) lazy init: {self.adapter.name()}: {self.adapter}, module: {self.name}")
 
-                # pre allocate buffers so accelerate can auto-bind merged weights in same tensor file as model
                 self.register_buffer(
                     "lora_A",
                     t.zeros((in_features, adapter.rank), dtype=t.float16),
@@ -169,20 +144,6 @@ class BaseQuantLinear(nn.Module):
                 )
             else:
                 pass
-                # print(f"Adapter lazy init: {self.adapter.name()}: {self.adapter}, module: {self.name}")
-
-            # TDOO: allow merged lora weights exist in gptq model safetensor file for direct loading
-            # EoRA need to preallocate buffers for Lora_A and B weights so HF can load
-            # self.register_buffer(
-            #     "lora_A",
-            #     torch.zeros((in_features, 128), dtype=torch.float16), # <-- EoRA lora_A shape needs to be calculated using pass in_features/out_features or other eora_test math
-            # )
-            #
-            # # EoRA need to preallocate buffers for Lora_A and B weights so HF can load
-            # self.register_buffer(
-            #     "lora_B",
-            #     torch.zeros((128, out_features), dtype=torch.float16), # <-- EoRA lora_A shape needs to be calculated using pass in_features/out_features or other eora_test math
-            # )
 
     def list_buffers(self) -> List:
         buf = []
@@ -211,7 +172,6 @@ class BaseQuantLinear(nn.Module):
         self._qzeros_format = format
         return self._qzeros_format
 
-    # override me, to perform post-weight load to device init
     def post_init(self):
         if self.adapter is not None:
             self.adapter.post_init(
@@ -221,7 +181,6 @@ class BaseQuantLinear(nn.Module):
                 lora_B=getattr(self, "lora_B", None))
 
     @classmethod
-    # custom quant linear class can override this and add custom checks
     def validate(
             cls,
             bits: int,
@@ -242,7 +201,6 @@ class BaseQuantLinear(nn.Module):
                              dynamic=dynamic, device=device, trainable=trainable, adapter=adapter)
 
     @classmethod
-    # internal method and should not be overriden
     def verify_supports_params(cls):
         """
         Validate that SUPPORTS parameters are not None or empty lists, raising an exception if the validation fails.
@@ -274,8 +232,6 @@ class BaseQuantLinear(nn.Module):
             if value is None:
                 raise ValueError(f"{cls.__name__}.{name} cannot be None.")
 
-            # if isinstance(value, list) and not value:
-            #     raise ValueError(f"{cls.__name__}.{name} cannot be an empty list.")
 
     @classmethod
     def _validate(cls, bits: int=4, group_size: int=128, desc_act: bool=False, sym: bool=False, pack_dtype:t.dtype=None, dynamic:Optional[dict]=None, in_features:int=None,
@@ -423,9 +379,6 @@ class PackableQuantLinear(BaseQuantLinear):
                 dtype=t.int32,
             ).reshape(1, 3, 12).to(device=self.g_idx.device)
 
-        # self.register_buffer("wf_unsqueeze_zero", wf.unsqueeze(0).to(device=self.g_idx.device))
-        # self.register_buffer("wf_unsqueeze_neg_one", wf.unsqueeze(-1).to(device=self.g_idx.device))
-        #
         self.wf_unsqueeze_zero = wf.unsqueeze(0).to(device=self.g_idx.device)
         self.wf_unsqueeze_neg_one = wf.unsqueeze(-1).to(device=self.g_idx.device)
 
@@ -571,15 +524,3 @@ class PackableQuantLinear(BaseQuantLinear):
                 col += 1
 
         self.qzeros = t.from_numpy(qzeros.astype(self.pack_np_dtype))
-
-        # assert
-        # assert isinstance(self, TorchQuantLinear), f"type: {self.__class_}"
-        # wq = linear.weight.data
-        # wq_dequantized = self.dequantize_weight().T
-        # print(f"------ WQ -----")
-        # print(wq)
-        # print(f"------ WQ Dequantized -----")
-        # print(wq_dequantized)
-        # assert t.equal(wq, wq_dequantized)
-
-        # print("self qw", self.qweight, self.scales, self.qzeros)
