@@ -4,14 +4,14 @@ from typing import Dict, List, Optional, Type, Union
 
 import torch
 
-from ..models._const import DEVICE
+from ..models._const import DEVICE, normalize_device
 from ..nn_modules.qlinear import BaseQuantLinear, PackableQuantLinear
 from ..nn_modules.qlinear.torch import TorchQuantLinear
 from ..quantization import FORMAT
 from ..utils.logger import setup_logger
 from . import BACKEND
 from .rocm import IS_ROCM
-from .torch import HAS_CUDA, HAS_MPS, HAS_XPU, auto_select_device, normalize_device
+from .torch import HAS_CUDA, HAS_MPS, HAS_XPU
 
 message_logged = False
 log = setup_logger()

@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import collections
 import functools
 import hashlib
@@ -8,7 +9,6 @@ import os
 import re
 import shutil
 import time
-import importlib
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
@@ -18,24 +18,23 @@ import threadpoolctl as tctl
 import torch
 import torch.nn as nn
 import transformers
-from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+from huggingface_hub import HfApi, hf_hub_download
 from packaging import version
-from packaging.version import Version, InvalidVersion
 from torch.nn.modules.conv import _ConvNd
-from transformers import PretrainedConfig, AutoConfig, AutoTokenizer
+from transformers import PretrainedConfig
 from transformers.pytorch_utils import id_tensor_storage
 from transformers.utils.hub import cached_file
 
 from ..looper.named_module import NamedModule
 from ..models._const import (CPU, EXPERT_INDEX_PLACEHOLDER, SUPPORTS_MODULE_TYPES)
 from ..nn_modules.qlinear import BaseQuantLinear
+from ..nn_modules.qlinear.torch import TorchQuantLinear
 from ..quantization import QuantizeConfig
 from ..quantization.config import FORMAT, FORMAT_FIELD_JSON, QUANT_METHOD, dynamic_get
 from .backend import BACKEND
 from .importer import select_quant_linear
 from .logger import setup_logger
 from .torch import torch_empty_cache, torch_new_stream_ctx
-from .torch import auto_select_device, normalize_device
 from ..models._const import DEVICE
 
 log = setup_logger()
@@ -80,10 +79,10 @@ def check_versions(model_class, requirements: List[str]):
     for req in requirements:
         pkg, operator, version_required = parse_requirement(req)
         try:
-            installed_version = importlib.metadata.version(pkg)
+            installed_version = version(pkg)
             if not compare_versions(installed_version, version_required, operator):
                 raise ValueError(f"{model_class} requires version {req}, but current {pkg} version is {installed_version} ")
-        except importlib.metadata.PackageNotFoundError:
+        except PackageNotFoundError:
             raise ValueError(f"{model_class} requires version {req}, but {pkg} not installed.")
 
 
@@ -106,7 +105,7 @@ def ModelLoader(cls):
             pretrained_model_id_or_path: str,
             quantize_config: QuantizeConfig,
             trust_remote_code: bool = False,
-            torch_dtype: Union[str, torch.dtype] = "auto",
+            torch_dtype: [str | torch.dtype] = "auto",
             device_map: Optional[Union[str, Dict[str, Union[int, str]]]] = None,
             device: Optional[Union[str, int]] = None,
             **model_init_kwargs,
@@ -201,15 +200,12 @@ def ModelLoader(cls):
             device_map: Optional[Union[str, Dict[str, Union[int, str]]]] = None,
             device: Optional[Union[str, int]] = None,
             backend: Union[str, BACKEND] = BACKEND.AUTO,
-            torch_dtype: str | torch.dtype = "auto",
+            torch_dtype: [str | torch.dtype] = "auto",
             trust_remote_code: bool = False,
             verify_hash: Optional[Union[str, List[str]]] = None,
             **kwargs,
     ):
-        # Normalize device and device_map
-        if device is not None:
-            device = normalize_device(device)
-        # device_map is assumed to be already normalized or handled below
+        device = normalize_device_device_map(device, device_map)
 
         if isinstance(backend, str):
             backend = BACKEND(backend)
@@ -307,13 +303,9 @@ def ModelLoader(cls):
 
         transformers.modeling_utils._init_weights = False
 
-        from transformers.utils import no_init_weights
         init_contexts = [no_init_weights()]
 
-        from contextlib import ExitStack
-        with ExitStack() as stack:
-            for ctx in init_contexts:
-                stack.enter_context(ctx)
+        with ContextManagers(init_contexts):
             if config.architectures:
                 model_class = getattr(transformers, config.architectures[0], None)
                 if model_class is not None and hasattr(model_class, "_supports_flash_attn_2"):
@@ -330,16 +322,8 @@ def ModelLoader(cls):
                 if USE_FLASH_ATTENTION_2 in kwargs:
                     args[USE_FLASH_ATTENTION_2] = kwargs.pop(USE_FLASH_ATTENTION_2, None)
                 if not args and importlib.util.find_spec("flash_attn") is not None:
+                    from transformers.utils import is_flash_attn_2_available
                     has_attn_implementation = Version(transformers.__version__) >= Version("4.46.0")
-                    # Define a helper to check flash_attn_2 availability
-                    def is_flash_attn_2_available():
-                        try:
-                            import importlib
-                            flash_attn = importlib.import_module("flash_attn")
-                            return hasattr(flash_attn, "flash_attn_func")
-                        except ImportError:
-                            return False
-
                     if is_flash_attn_2_available() and has_attn_implementation:
                         args = {ATTN_IMPLEMENTATION: "flash_attention_2"}
                     elif is_flash_attn_2_available() and not has_attn_implementation:
