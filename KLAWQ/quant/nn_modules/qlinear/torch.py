@@ -76,8 +76,6 @@ class TorchQuantLinear(PackableQuantLinear):
         if mode == old_train:
             return self
 
-        from ...utils.model import convert_gptq_v1_to_v2_format_module
-
         if self.SUPPORTS_TRAINING_USE_TORCH_KERNEL:
             if mode:
                 if self.qzero_format() == 1:

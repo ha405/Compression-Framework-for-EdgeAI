@@ -419,22 +419,6 @@ class BaseGPTQModel(nn.Module):
 
         return self
 
-    def serve(self,
-               host: str = "0.0.0.0",
-               port: int = 80,
-               async_mode: bool = False):
-        from ..utils.openai_server import OpenAiServer
-        self.server = OpenAiServer(model=self)
-        self.server.start(host=host, port=port, async_mode=async_mode)
-
-    def serve_shutdown(self):
-        if self.server is not None:
-            self.server.shutdown()
-
-    def serve_wait_until_ready(self, timeout: int = 30, check_interval: float = 0.1):
-        if self.server is not None:
-            self.server.wait_until_ready(timeout=timeout, check_interval=check_interval)
-
     def pre_quantize_generate_hook_start(self):
         pass
 
