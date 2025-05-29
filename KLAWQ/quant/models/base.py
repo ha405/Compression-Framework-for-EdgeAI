@@ -14,7 +14,7 @@ from tokenicer import Tokenicer
 from transformers import (AutoModelForCausalLM, AutoProcessor, PreTrainedModel,
                           PreTrainedTokenizerBase, ProcessorMixin, modeling_utils)
 
-from ..nn_modules.hooked_linear import replace_module_with_hooked_tree
+from ..nn_modules.hooked_linear import replace_module_with_hooked_legacy, replace_module_with_hooked_tree
 from ..nn_modules.qlinear import BaseQuantLinear
 from ..quantization import GPTQ, QuantizeConfig
 from ..quantization.config import FORMAT, QUANT_METHOD, QUANTIZE_BLACK_LIST
@@ -88,6 +88,8 @@ class BaseGPTQModel(nn.Module):
         quantized: bool,
         quantize_config: QuantizeConfig,
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
+        qlinear_kernel: nn.Module = None,  # Re-added
+        load_quantized_model: bool = False, # Re-added
         trust_remote_code: bool = False,
         model_local_path: str = None,
     ):
@@ -97,6 +99,8 @@ class BaseGPTQModel(nn.Module):
 
         self.compiled = False
         self.quantized = quantized
+        self.qlinear_kernel = qlinear_kernel # Re-added assignment
+        self.load_quantized_model = load_quantized_model # Re-added assignment
         if tokenizer is not None:
             if isinstance(tokenizer, PreTrainedTokenizerBase):
                 self.tokenizer = Tokenicer.load(tokenizer, trust_remote_code=trust_remote_code)
@@ -414,6 +418,22 @@ class BaseGPTQModel(nn.Module):
         self.model = torch_compile(self.model, fullgraph=fullgraph, backend=backend, mode=mode)
 
         return self
+
+    def serve(self,
+               host: str = "0.0.0.0",
+               port: int = 80,
+               async_mode: bool = False):
+        from ..utils.openai_server import OpenAiServer
+        self.server = OpenAiServer(model=self)
+        self.server.start(host=host, port=port, async_mode=async_mode)
+
+    def serve_shutdown(self):
+        if self.server is not None:
+            self.server.shutdown()
+
+    def serve_wait_until_ready(self, timeout: int = 30, check_interval: float = 0.1):
+        if self.server is not None:
+            self.server.wait_until_ready(timeout=timeout, check_interval=check_interval)
 
     def pre_quantize_generate_hook_start(self):
         pass
