@@ -92,7 +92,7 @@ class GPTQProcessor(LoopProcessor):
             del inp, out
         return tmp
 
-    def process(self, module: NamedModule, auto_gc: auto_gc = True):
+    def process(self, module: NamedModule, auto_gc: bool = True):
         if torch.cuda.device_count() > 1:
             torch.cuda.synchronize()
 
