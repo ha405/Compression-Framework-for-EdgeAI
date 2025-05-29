@@ -76,22 +76,6 @@ class TorchQuantLinear(PackableQuantLinear):
         if mode == old_train:
             return self
 
-        if self.SUPPORTS_TRAINING_USE_TORCH_KERNEL:
-            if mode:
-                if self.qzero_format() == 1:
-                    if not hasattr(self, "qzeros_data_v1"):
-                        self.qzeros_data_v1 = self.qzeros.data.clone()
-                        convert_gptq_v1_to_v2_format_module(self, bits=self.bits, pack_dtype=self.pack_dtype)
-                        self.qzeros_data_v2 = self.qzeros.data
-                    else:
-                        self.qzeros.data = self.qzeros_data_v2
-                        self.qzero_format(format=2)
-
-            else:
-                if hasattr(self, "qzeros_data_v1"):
-                    self.qzeros.data = self.qzeros_data_v1
-                    self.qzero_format(format=1)
-
         return super().train(mode=mode)
 
     def forward(self, x: torch.Tensor):
