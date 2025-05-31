@@ -7,14 +7,13 @@
 
 ## Features
 
-**GPTQ Quantization:** Primary support for GPTQ algorithm, a leading quantization method for LLMs.
-**Wide Model Support:**  A growing list of predefined configurations for popular model architectures (LLaMA, Mistral, Qwen, Phi, and others), simplifying the quantization process.
-**Hardware Acceleration:** Optimized kernels for CUDA, XPU, MPS, and CPU (with IPEX) to leverage hardware acceleration.
-**Dynamic Quantization:** Flexible quantization configurations, allowing for different quantization settings per module.
-**Integration with Hugging Face Transformers:** Seamless integration with the Hugging Face Transformers library, enabling easy loading and saving of quantized models.
-**Evaluation Tools**: Integrated tooling to easily evaluate performance after quantization with LM-Eval, EvalPlus and MMLU Pro.
-**Logging and Monitoring**: Extensive logging capabilities for monitoring the quantization process, including layer-wise loss, memory usage, and quantization time.
-**ClearML Integration**: Built-in support for ClearML for experiment tracking and management.
+Primary support for GPTQ algorithm, a leading quantization method for LLMs.
+A growing list of predefined configurations for popular model architectures (LLaMA, Mistral, Qwen, Phi, and others), simplifying the quantization process.
+Optimized kernels for CUDA, XPU, MPS, and CPU (with IPEX) to leverage hardware acceleration.Flexible quantization configurations, allowing for different quantization settings per module.
+Seamless integration with the Hugging Face Transformers library, enabling easy loading and saving of quantized models.
+Integrated tooling to easily evaluate performance after quantization with LM-Eval, EvalPlus and MMLU Pro.
+Extensive logging capabilities for monitoring the quantization process, including layer-wise loss, memory usage, and quantization time.
+Built-in support for ClearML for experiment tracking and management.
 
 ## Installation
 
