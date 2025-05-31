@@ -1,4 +1,3 @@
-```markdown
 # GPTQModel
 
 GPTQModel is a Python library designed to facilitate the quantization of large language models (LLMs) using the GPTQ algorithm. It offers tools for loading, quantizing, evaluating, and saving quantized models. This README provides a comprehensive guide to using the library, including installation instructions, basic usage examples, and detailed explanations of key features.
