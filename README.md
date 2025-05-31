@@ -1,19 +1,39 @@
 ```markdown
-# KLAWQ/quant
+# GPTQModel
 
-[![PyPI Version](https://img.shields.io/pypi/v/gptqmodel)](https://pypi.org/project/gptqmodel/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Python Versions](https://img.shields.io/pypi/pyversions/gptqmodel)](https://pypi.org/project/gptqmodel/)
+GPTQModel is a Python library designed to facilitate the quantization of large language models (LLMs) using the GPTQ algorithm. It offers tools for loading, quantizing, evaluating, and saving quantized models. This README provides a comprehensive guide to using the library, including installation instructions, basic usage examples, and detailed explanations of key features.
+
+## Table of Contents
+
+- [Features](#features)
+- [Installation](#installation)
+- [Usage](#usage)
+  - [Loading a Model](#loading-a-model)
+  - [Quantizing a Model](#quantizing-a-model)
+  - [Evaluating a Model](#evaluating-a-model)
+  - [Saving a Model](#saving-a-model)
+  - [Pushing to Hub](#pushing-to-hub)
+- [Quantization Configuration](#quantization-configuration)
+- [Backend Support](#backend-support)
+- [Logging](#logging)
+- [Environment Variables](#environment-variables)
+- [Memory Management](#memory-management)
+- [Model Definitions](#model-definitions)
+- [Known Issues and Limitations](#known-issues-and-limitations)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Features
 
-Primary support for GPTQ algorithm, a leading quantization method for LLMs.
-A growing list of predefined configurations for popular model architectures (LLaMA, Mistral, Qwen, Phi, and others), simplifying the quantization process.
-Optimized kernels for CUDA, XPU, MPS, and CPU (with IPEX) to leverage hardware acceleration.Flexible quantization configurations, allowing for different quantization settings per module.
-Seamless integration with the Hugging Face Transformers library, enabling easy loading and saving of quantized models.
-Integrated tooling to easily evaluate performance after quantization with LM-Eval, EvalPlus and MMLU Pro.
-Extensive logging capabilities for monitoring the quantization process, including layer-wise loss, memory usage, and quantization time.
-Built-in support for ClearML for experiment tracking and management.
+- **GPTQ Quantization:** Implements the GPTQ algorithm for quantizing LLMs, reducing their size and improving inference speed.
+- **Model Loading:** Supports loading models from Hugging Face Hub or local paths.
+- **Evaluation:** Provides tools for evaluating model performance using standard benchmarks.
+- **Saving:** Allows saving quantized models in a compact format.
+- **Backend Flexibility:** Supports multiple backends, including `torch`, `triton`, `exllama`, `exllama_v2`, `marlin`, `bitblas`, and `ipex` for optimized performance on different hardware.
+- **Configuration:** Offers a flexible quantization configuration system with dynamic per-module settings.
+- **Logging:** Integrates with `logbar` for detailed logging and progress tracking.
+- **Integration with External Inference Engines**: Seamlessly integrates with popular external inference engines like `vllm`, `sglang`, and `mlx` for accelerated deployment and inference.
+- **Support for Mixture of Experts**: Easily quantize MoE models such as Mixtral, Qwen2-MoE, DeepSeek V2/V3 with dynamic expert indexing for proper routing of quantizable modules.
 
 ## Installation
 
@@ -21,158 +41,221 @@ Built-in support for ClearML for experiment tracking and management.
 pip install gptqmodel
 ```
 
-For specific features or logging:
+For extended features and dependencies (like evaluation or specific loggers):
 
 ```bash
-pip install gptqmodel[logger]  # For clearml support
-pip install gptqmodel[eval] # For EvalPlus
+pip install gptqmodel[all]
+```
+
+or
+
+```bash
+pip install gptqmodel[eval]
 ```
 
 ## Usage
+
+### Loading a Model
+
+```python
+from KLAWQ.quant.models import GPTQModel
+from KLAWQ.quant.quantization import QuantizeConfig
+
+model_id = "facebook/opt-125m" # Replace with your model ID
+
+# Load a pre-trained model with a quantization configuration
+model = GPTQModel.load(model_id)
+
+# Alternatively, load the model with custom configurations
+qconfig = QuantizeConfig(bits=4, group_size=128, desc_act=True)
+model = GPTQModel.load(model_id, quantize_config=qconfig)
+```
 
 ### Quantizing a Model
 
 ```python
 from KLAWQ.quant.models import GPTQModel
 from KLAWQ.quant.quantization import QuantizeConfig
+from transformers import AutoTokenizer
 
-# Load a model
 model_id = "facebook/opt-125m"
+model = GPTQModel.from_pretrained(model_id, quantize_config=qconfig)
 
-# Define a quantization configuration
-quantize_config = QuantizeConfig(bits=4, group_size=128, desc_act=True)
+# Prepare a dataset for calibration (replace with your data)
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+calibration_data = ["This is a sample sentence.", "Another example for calibration."]
 
-# Load and quantize the model
-gptq_model = GPTQModel.from_pretrained(model_id, quantize_config)
-
-# Perform quantization (calibration dataset required)
-calibration_dataset = ["This is a sample sentence.", "Another example for calibration."]  # Replace with a real dataset
-quant_log = gptq_model.quantize(calibration_dataset)
-
-# Save the quantized model
-gptq_model.save_quantized("path/to/save/quantized/model")
+# Quantize the model using a calibration dataset
+quant_log = model.quantize(calibration_data, batch_size=1)
 ```
 
-### Loading a Quantized Model
+### Evaluating a Model
 
 ```python
 from KLAWQ.quant.models import GPTQModel
+from KLAWQ.quant.utils import EVAL
+from transformers import AutoTokenizer
 
-# Load a quantized model
-model_path = "path/to/save/quantized/model"
-quantized_model = GPTQModel.load(model_path)
+model_id = "facebook/opt-125m"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = GPTQModel.load(model_id)
 
-# Use the quantized model for inference
-text = "Generate an introduction to large language models"
-output = quantized_model.generate(text)
-print(output)
-```
-
-### Evaluating a Quantized Model
-
-```python
-from KLAWQ.quant.models import GPTQModel
-from KLAWQ.quant.utils.eval import EVAL
-
-# Load the quantized model
-model_path = "path/to/save/quantized/model"
-quantized_model = GPTQModel.load(model_path)
-
-# Evaluate on a specific task
-results = GPTQModel.eval(
-    model_or_id_or_path=quantized_model,
-    tasks=[EVAL.LM_EVAL.HELLASWAG]
-)
-
+# Evaluate the model using a specified task
+results = GPTQModel.eval(model_or_id_or_path=model, tokenizer=tokenizer, tasks=[EVAL.LM_EVAL.HELLASWAG])
 print(results)
 ```
 
-## Repository Structure
+### Saving a Model
 
+```python
+from KLAWQ.quant.models import GPTQModel
+
+model_id = "facebook/opt-125m"
+model = GPTQModel.load(model_id)
+output_dir = "path/to/save/quantized/model"
+
+# Save the quantized model
+model.save(output_dir)
 ```
-KLAWQ/quant/
-├── __init__.py         # Main entry point for the library
-├── looper/             # Module looping and processing logic
-│   ├── __init__.py
-│   ├── dequantize_processor.py # Processor for dequantizing models.
-│   ├── gptq_processor.py   # Processor for GPTQ quantization.
-│   ├── input_cache.py      # Data structures for caching layer inputs.
-│   ├── loop_processor.py   # Base class for loop processors.
-│   └── module_looper.py    # Main loop logic for processing modules.
-├── models/             # Definitions and auto-loading of quantized models
-│   ├── __init__.py
-│   ├── _const.py          # Constants used in model definitions.
-│   ├── auto.py           # Auto-loading logic for GPTQ models.
-│   ├── base.py           # Base class for GPTQ models.
-│   ├── definitions/      # Model specific configurations
-│   │   ├── __init__.py
-│   │   ├── deepseek_v2.py  # Model definition for DeepSeek V2.
-│   │   ├── deepseek_v3.py  # Model definition for DeepSeek V3.
-│   │   ├── gpt2.py         # Model definition for GPT2.
-│   │   ├── llama.py        # Model definition for LLaMA.
-│   │   ├── mistral.py      # Model definition for Mistral.
-│   │   ├── mixtral.py      # Model definition for Mixtral.
-│   │   ├── mllama.py       # Model definition for MLlama.
-│   │   ├── mobilellm.py    # Model definition for MobileLLM.
-│   │   ├── phi.py          # Model definition for Phi.
-│   │   ├── phi3.py         # Model definition for Phi-3 family
-│   │   ├── phi4.py         # Model definition for Phi-4 family
-│   │   ├── qwen.py         # Model definition for Qwen.
-│   │   ├── qwen2.py        # Model definition for Qwen2.
-│   │   ├── qwen2_5_vl.py    # Model definition for Qwen2.5-VL.
-│   │   ├── qwen2_moe.py    # Model definition for Qwen2-MoE.
-│   │   └── qwen2_vl.py     # Model definition for Qwen2-VL.
-│   ├── loader.py         # Model loading logic
-│   └── writer.py         # Model writing logic
-├── nn_modules/         # Custom neural network modules (QLinear)
-│   ├── __init__.py
-│   ├── hooked_linear.py  # Hooked Linear modules for forwarding processing
-│   └── qlinear/          # Quantized Linear layers
-│       ├── __init__.py
-│       ├── bitblas_target_detector.py # Helper file for detecting the correct bitblas target.
-│       ├── torch.py        # PyTorch implementation of quantized linear layers.
-│       └── utils.py        # Utility functions for quantized linear layers.
-├── quantization/       # Quantization algorithms and configurations
-│   ├── __init__.py
-│   ├── config.py         # Configuration classes for quantization.
-│   ├── gptq.py           # Implementation of the GPTQ quantization algorithm.
-│   └── quantizer.py      # Base classes for quantizers.
-├── utils/              # Utility functions (logger, data, model...)
-│   ├── __init__.py
-│   ├── backend.py        # Backend-related enums and utilities.
-│   ├── calibration.py   # Helper functions for calibration process.
-│   ├── data.py           # Data loading and processing utilities.
-│   ├── device.py         # Device utilities (GPU memory usage).
-│   ├── eval.py           # Evaluation utilities.
-│   ├── evalplus.py        # EvalPlus evaluation setup.
-│   ├── hf.py             # Hugging Face model helper functions.
-│   ├── image.py          # Image processing utilities.
-│   ├── importer.py       # Module importing and selection utilities.
-│   ├── logger.py         # Logging setup.
-│   ├── mmlupro.py        # Helper functions to run mmlu pro eval
-│   ├── model.py          # Model manipulation utilities.
-│   ├── plotly.py         # Plotly helpers.
-│   ├── rocm.py           # ROCm-specific utilities.
-│   ├── safetensor.py     # Utilities for working with safetensors.
-│   ├── tensor.py         # Utilities for model parameters count and size calculation
-│   ├── terminal.py       # Terminal utilities for size calculation
-│   └── torch.py          # PyTorch-related utilities.
-└── version.py          # Library version information
+
+### Pushing to Hub
+
+```python
+from KLAWQ.quant.models import GPTQModel
+
+quantized_path = "path/to/save/quantized/model"
+repo_id = "your_username/your_quantized_model" #replace with your actual repo name
+
+# Push the quantized model to the Hugging Face Hub
+GPTQModel.push_to_hub(repo_id, quantized_path, private=True, exists_ok=True)
 ```
+
+## Quantization Configuration
+
+The `QuantizeConfig` class allows you to specify various parameters for the quantization process.
+
+```python
+from KLAWQ.quant.quantization import QuantizeConfig
+
+qconfig = QuantizeConfig(
+    bits=4,                      # Quantization bits
+    group_size=128,               # Group size for quantization
+    desc_act=True,                 # Use descriptor-aware quantization
+    sym=True,                      # Symmetric quantization
+    damp_percent=0.01,             # Damping percentage for the Hessian inverse
+    damp_auto_increment=0.0015,    # Increment value for damping
+    dynamic=None,              # Per-module configuration (Dynamic Quantization)
+
+    #Quant Method and Format parameters
+    quant_method = 'gptq',
+    format = 'gptq',
+    pack_dtype = torch.int32,   # Data type to pack the quantized weights
+    lm_head = False # whether to quantize lm_head
+
+)
+```
+
+**Dynamic Quantization**
+
+The `dynamic` attribute allows you to specify different quantization parameters for different modules in the model. This can be useful for optimizing the quantization process for specific layers.
+
+```python
+qconfig = QuantizeConfig(
+    bits=4,
+    group_size=128,
+    desc_act=True,
+    sym=True,
+    dynamic={
+        "+:.*attention.*": {"bits": 8},  # Set attention layers to 8 bits
+        "-:.*ffn.*": False           # Skip ffn layers
+    }
+)
+```
+
+**Custom Module Configuration with EXPERT_INDEX_PLACEHOLDER**
+  
+For mixture of experts models it can be neccesary to specify expert modules dynamically. This can be done using `EXPERT_INDEX_PLACEHOLDER` constant.
+
+```python
+from KLAWQ.quant.models._const import EXPERT_INDEX_PLACEHOLDER
+
+qconfig = QuantizeConfig(
+    bits=4,
+    group_size=128,
+    desc_act=True,
+    sym=True,
+    dynamic={
+        f"+:.*experts.{EXPERT_INDEX_PLACEHOLDER}.*": {"bits": 4},
+    }
+)
+```
+
+## Backend Support
+
+GPTQModel supports multiple backends for different hardware/software configurations.
+
+- `TORCH`: For compatibility and general purpose.
+- `TRITON`: For faster execution on NVIDIA GPUs.
+- `EXLLAMA_V1/V2`: Optimized for specific batch sizes.
+- `MARLIN/MARLIN_FP16`: Experimental kernels for further performance gains.
+- `BITBLAS`: Higher speed at the cost of pre-compilation.
+- `IPEX`: Kernel Optimized for Intel XPU and CPU.
+- `VLLM`, `SGLANG`, and `MLX`: for seamless integration with external inference engines.
+
+Example specifying backend:
+
+```python
+model = GPTQModel.load(model_id, backend="triton")
+```
+
+## Logging
+
+The library uses the `logbar` library for logging. You can control the logging level and output format using the standard Python logging configuration.
+
+## Environment Variables
+
+- `PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True'`: Optimizes memory allocation for CUDA.
+- `CUDA_DEVICE_ORDER='PCI_BUS_ID'`: Ensures correct device ordering.
+- `GPTQMODEL_USE_MODELSCOPE='True'`: to download from modelscope instead of huggingface hub.
+  - If used, the library will attempt to download from modelscope, install it using `pip install modelscope`.
+- `DEBUG`: enable debug logs by setting env.
+
+## Memory Management
+
+- The library uses `torch_empty_cache()` to free up GPU memory during the quantization process.
+- It is recommended to have sufficient GPU memory to load and quantize the model.
 
 ## Model Definitions
-The `/KLAWQ/quant/models/definitions` directory contains model-specific quantization configurations that are dynamically loaded by the library. Each file in this directory defines the architecture and quantization settings for a supported model. Key elements typically found in these definitions:
-* `base_modules`: Modules residing outside the primary layer structure (e.g., input embeddings, final normalization layers).
-* `layers_node`: The location of the repeating model layers (e.g., decoder blocks).
-* `layer_type`: The class of the repeating model layer.
-* `layer_modules`: List of quantized operations within each repeating layer, specified by module name.
-* `pre_lm_head_norm_module`:  The final normalization layer that is quantized before the `lm_head` layer.
+
+The library includes pre-defined configurations for various model architectures, such as:
+
+- `LlamaGPTQ`
+- `MistralGPTQ`
+- `MixtralGPTQ`
+- `QwenGPTQ`
+- `Qwen2GPTQ`
+- `PhiGPTQ`
+- `DeepSeekV2GPTQ`
+- `DeepSeekV3GPTQ`
+
+You can extend the library to support additional model architectures by creating new model definition classes (see existing definitions in `KLAWQ/quant/models/definitions/`).
+
+## Known Issues and Limitations
+
+- Quantization process can be memory intensive. It might require a significant amount of VRAM.
+- Not all models and configurations are supported. Check compatibility before using.
+- Tied weights with `lm_head` are not fully supported with quantization.
 
 ## Contributing
 
-Contributions are welcome! Please see the [CONTRIBUTING.md](link-to-contributing-guide) for guidelines.
+Contributions to GPTQModel are welcome! To contribute, please follow these steps:
+
+1.  Fork the repository.
+2.  Create a new branch for your feature or bug fix.
+3.  Implement your changes and add appropriate tests.
+4.  Submit a pull request with a clear description of your changes.
 
 ## License
 
-This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details.
+GPTQModel is licensed under the Apache License 2.0.
 ```
