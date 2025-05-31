@@ -5,8 +5,6 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python Versions](https://img.shields.io/pypi/pyversions/gptqmodel)](https://pypi.org/project/gptqmodel/)
 
-**KLAWQ/quant** is a high-performance model quantization library designed to enable efficient deployment of large language models (LLMs).  It offers state-of-the-art quantization techniques, with a focus on GPTQ (Generative Post-training Quantization), to reduce model size and accelerate inference, while maintaining acceptable accuracy.
-
 ## Features
 
 *   **GPTQ Quantization:** Primary support for GPTQ algorithm, a leading quantization method for LLMs.
