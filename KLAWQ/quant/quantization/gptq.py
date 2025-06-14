@@ -86,6 +86,7 @@ class GPTQ:
         if not hasattr(self.qcfg, 'tau'): self.qcfg.tau = 1.0
         if not hasattr(self.qcfg, 'damp_percent'): self.qcfg.damp_percent = 0.01
         if not hasattr(self.qcfg, 'damp_auto_increment'): self.qcfg.damp_auto_increment = 0.0015
+        if not hasattr(self.qcfg, 'gamma'): self.qcfg.gamma = 0.0
 
         self.device = self.module.weight.device
         self.compute_device = DEVICE_1 if DEVICE_1.type != 'cpu' else CPU
@@ -223,6 +224,18 @@ class GPTQ:
                 kl_weights = torch.zeros(batch_token_size, device=self.compute_device, dtype=torch.float32)
             weighted_inp = reshaped_inp * torch.sqrt(kl_weights).unsqueeze(1)
             self.A.addmm_(weighted_inp.T, weighted_inp, beta=beta_scale, alpha=alpha_scale)
+        
+            if self.qcfg.gamma > 0:
+                if self.B is None:
+                    self.B = torch.zeros((self.columns, self.columns),
+                                        dtype=torch.float32, device=self.compute_device)
+                qt = F.softmax(output / tau, dim=-1)
+                ce_weights = torch.sum(qt * (1.0 - qt), dim=-1).clamp(min=0.0)
+                weighted_inp_ce = reshaped_inp * torch.sqrt(ce_weights).unsqueeze(1)
+                self.B.addmm_(weighted_inp_ce.T,
+                            weighted_inp_ce,
+                            beta=beta_scale,
+                            alpha=alpha_scale)
 
         self.nsamples += batch_token_size
 
@@ -276,16 +289,16 @@ class GPTQ:
 
         if self.nsamples == 0: raise ValueError(f"No samples collected {self.name}")
         if self.H is None: raise RuntimeError(f"Hessian is None {self.name}")
-
+        H_tot = self.H
         if self.qcfg.beta > 0 and self.A is not None:
-            log.debug(f"Combining H and A with beta={self.qcfg.beta} for {self.name}")
-            H_tot = self.H + self.qcfg.beta * self.A
-        elif self.qcfg.beta > 0 and self.A is None:
-             log.warning(f"qcfg.beta > 0 but Fisher matrix A is None for {self.name}. Using only H.")
-             H_tot = self.H
-        else: H_tot = self.H
+            log.debug(f"Adding KL Hessian with beta={self.qcfg.beta}")
+            H_tot = H_tot + self.qcfg.beta * self.A
+        if self.qcfg.gamma > 0 and hasattr(self, 'B') and self.B is not None:
+            log.debug(f"Adding CE Hessian with gamma={self.qcfg.gamma}")
+            H_tot = H_tot + self.qcfg.gamma * self.B
         del self.H; self.H = None
         if hasattr(self, 'A'): del self.A; self.A = None
+        if hasattr(self, 'B'): del self.B; self.B = None
 
         W = self.W_orig.clone()
         del self.W_orig; self.W_orig = None
