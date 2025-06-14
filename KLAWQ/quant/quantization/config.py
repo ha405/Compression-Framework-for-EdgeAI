@@ -134,6 +134,7 @@ class QuantizeConfig():
 
     beta: float = field(default=0.0, metadata={"help": "Strength of KL divergence term (beta=0 recovers vanilla GPTQ)"})
     tau: float = field(default=1.0, metadata={"help": "Temperature for softmax in KL divergence calculation (must be > 0)"})
+    tau: float = field(default=0.0, metadata={"help": "for CE term (must be > 0)"})
 
     def __post_init__(self):
         fields_info = fields(self)
@@ -199,6 +200,8 @@ class QuantizeConfig():
             raise ValueError("QuantizeConfig: `beta` must be non-negative (>= 0).")
         if self.tau <= 0:
             raise ValueError("QuantizeConfig: `tau` (temperature) must be positive (> 0).")
+        if self.gamma < 0:
+            raise ValueError("QuantizeConfig: `gamma` must be non-negative (>= 0).")
 
     def meta_set(self, key: str, value: Any):
         self.meta[key] = value
@@ -322,6 +325,7 @@ class QuantizeConfig():
             META_FIELD: self.meta,
             "beta": self.beta,
             "tau": self.tau,
+            "gamma": self.gamma
         }
 
         out = {k: v for k, v in out.items() if v is not None and (v not in [None, {}])}
