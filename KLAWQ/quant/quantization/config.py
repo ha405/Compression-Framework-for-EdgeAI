@@ -134,7 +134,7 @@ class QuantizeConfig():
 
     beta: float = field(default=0.0, metadata={"help": "Strength of KL divergence term (beta=0 recovers vanilla GPTQ)"})
     tau: float = field(default=1.0, metadata={"help": "Temperature for softmax in KL divergence calculation (must be > 0)"})
-    tau: float = field(default=0.0, metadata={"help": "for CE term (must be > 0)"})
+    gamma: float = field(default=0.0, metadata={"help": "for CE term (must be > 0)"})
 
     def __post_init__(self):
         fields_info = fields(self)
