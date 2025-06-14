@@ -99,6 +99,7 @@ class GPTQ:
 
         self.H: Optional[torch.Tensor] = None
         self.A: Optional[torch.Tensor] = None
+        self.B: Optional[torch.Tensor] = None
         self.nsamples: int = 0
 
         if Quantizer is None: raise ImportError("Quantizer class not found.")
