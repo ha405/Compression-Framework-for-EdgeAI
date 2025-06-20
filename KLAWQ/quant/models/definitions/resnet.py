@@ -7,7 +7,11 @@ import torch.nn as nn
 from PIL.Image import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision.models import resnet50
-from torchvision.transforms import v2 as transforms
+try:
+    from torchvision.transforms import v2 as transforms
+except ImportError:
+    from torchvision import transforms
+
 
 from ..base import BaseGPTQModel
 from ...utils.data import collate_data
@@ -18,8 +22,8 @@ class ResNet50GPTQ(BaseGPTQModel):
     """
     GPTQ configuration for the torchvision.models.resnet50 model.
     """
-    loader = resnet50
     is_hf_model = False
+    loader = resnet50
     base_modules = [
         "conv1",
         "fc",
@@ -33,6 +37,7 @@ class ResNet50GPTQ(BaseGPTQModel):
         ["conv3"],
         ["downsample.0"],
     ]
+    layer_modules_strict = False
     modality = [MODALITY.IMAGE]
     require_load_processor = False
 
@@ -56,23 +61,14 @@ class ResNet50GPTQ(BaseGPTQModel):
     ) -> List[Dict[str, torch.Tensor]]:
         """
         Overrides the base method to prepare an image dataset for calibration.
-
-        Args:
-            calibration_dataset (Union[List[Image], Dataset]): A list of PIL Images
-                or a PyTorch Dataset that returns PIL images.
-            batch_size (int): The batch size for calibration.
-
-        Returns:
-            A list of dictionaries, where each dictionary represents a batch
-            and contains the key 'x' with a batched tensor of pixel values.
         """
         image_transforms = transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
-            transforms.ToImage(), 
-            transforms.ToDtype(torch.float32, scale=True), 
+            transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
+        
         class ImageDataset(Dataset):
             def __init__(self, images, transform):
                 self.images = images
@@ -88,10 +84,12 @@ class ResNet50GPTQ(BaseGPTQModel):
         if isinstance(calibration_dataset, list):
             dataset = ImageDataset(calibration_dataset, image_transforms)
         elif isinstance(calibration_dataset, Dataset):
-            dataset = ImageDataset(calibration_dataset, image_transforms) 
+            dataset = ImageDataset(calibration_dataset, image_transforms)
         else:
             raise ValueError("calibration_dataset must be a list of PIL Images or a PyTorch Dataset.")
+            
         data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+        
         batched_data = []
         for batch in data_loader:
             batched_data.append({'x': batch})
