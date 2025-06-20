@@ -70,6 +70,7 @@ def ModelWriter(cls):
                               entry.get(QUANT_LOG_DAMP), entry.get(PROCESS_LOG_TIME)] for entry in self.quant_log])
 
         pre_quantized_size_mb = get_model_files_size(self.model_local_path)
+        # This line is safe because 0.0 / 1024 is 0.0
         pre_quantized_size_gb = pre_quantized_size_mb / 1024
 
         quantizers = [f"{META_QUANTIZER_GPTQMODEL}:{__version__}"]
@@ -114,7 +115,6 @@ def ModelWriter(cls):
             value=self.quantize_config.mse
         )
         
-        # ADDED: Check if the model class is a Hugging Face model.
         is_hf_model = getattr(self, "is_hf_model", True)
         
         quantize_config = copy.deepcopy(self.quantize_config)
@@ -131,17 +131,13 @@ def ModelWriter(cls):
             )
 
         if is_hf_model:
-            # --- START OF ORIGINAL HUGGING FACE LOGIC (UNTOUCHED) ---
             config = copy.deepcopy(self.model.config)
             config.quantization_config = quantize_config.to_dict()
             self.model.config = config
             self.model.save_pretrained(save_dir, state_dict={}, is_main_process=True)
-            # --- END OF ORIGINAL HUGGING FACE LOGIC ---
         else:
-            # ADDED: Logic for non-Hugging Face models
             log.info("Skipping model.config and model.save_pretrained for non-HuggingFace model.")
         
-        # This part is common and critical for both model types
         quantize_config.save_pretrained(save_dir)
 
         if hasattr(self,"processor") and isinstance(self.processor, ProcessorMixin):
@@ -155,7 +151,7 @@ def ModelWriter(cls):
         state_dict = {k: v.clone().contiguous() for k, v in state_dict.items()}
         model_save_name = model_base_name + ".safetensors"
 
-        if not self.qlinear_kernel.SUPPORTS_SHARDS and max_shard_size is not None:
+        if hasattr(self, 'qlinear_kernel') and self.qlinear_kernel and not self.qlinear_kernel.SUPPORTS_SHARDS and max_shard_size is not None:
             log.warn("Sharding is not supported for this quant. Disabling sharding.")
             max_shard_size = None
 
@@ -259,44 +255,51 @@ def ModelWriter(cls):
                     f.write(content)
 
         if not self.load_quantized_model:
-            total_size_gb = total_size_mb / 1024
-            size_diff_mb = pre_quantized_size_mb - total_size_mb
-            size_diff_gb = size_diff_mb / 1024
-            percent_diff = (size_diff_mb / pre_quantized_size_mb) * 100
-            log.info(f"Pre-Quantized model size: {pre_quantized_size_mb:.2f}MB, {pre_quantized_size_gb:.2f}GB")
-            log.info(f"Quantized model size: {total_size_mb:.2f}MB, {total_size_gb:.2f}GB")
-            log.info(f"Size difference: {size_diff_mb:.2f}MB, {size_diff_gb:.2f}GB - {percent_diff:.2f}%")
+            # --- START OF THE DEFINITIVE FIX ---
+            # This block prevents the ZeroDivisionError by checking the original model size.
+            if pre_quantized_size_mb > 0:
+                total_size_gb = total_size_mb / 1024
+                size_diff_mb = pre_quantized_size_mb - total_size_mb
+                size_diff_gb = size_diff_mb / 1024
+                percent_diff = (size_diff_mb / pre_quantized_size_mb) * 100
+                log.info(f"Pre-Quantized model size: {pre_quantized_size_mb:.2f}MB, {pre_quantized_size_gb:.2f}GB")
+                log.info(f"Quantized model size: {total_size_mb:.2f}MB, {total_size_gb:.2f}GB")
+                log.info(f"Size difference: {size_diff_mb:.2f}MB, {size_diff_gb:.2f}GB - {percent_diff:.2f}%")
+            else:
+                # If original size is 0, just print the new size without comparison.
+                total_size_gb = total_size_mb / 1024
+                log.info(f"Quantized model size: {total_size_mb:.2f}MB, {total_size_gb:.2f}GB")
+                log.info("Could not determine original model size. Skipping size difference calculation.")
+            # --- END OF THE DEFINITIVE FIX ---
 
-        if self.trust_remote_code and is_hf_model: # MODIFIED: only copy files for hf models
+        if self.trust_remote_code and is_hf_model: 
             copy_py_files(save_dir, model_id_or_path=self.model_local_path)
 
         if self.tokenizer:
             self.tokenizer.save_pretrained(save_dir)
 
             saved_tokenizer_config = get_tokenizer_config(save_dir)
-            config_tokenizer_class = saved_tokenizer_config.get("tokenizer_class")
-            if (not config_tokenizer_class.endswith("Fast")) and (
-                isinstance(self.tokenizer.tokenizer, PreTrainedTokenizerFast)
-                ):
-                saved_tokenizer_config["tokenizer_class"] = saved_tokenizer_config["tokenizer_class"] + "Fast"
-                with open(os.path.join(save_dir, "tokenizer_config.json"), "w", encoding="utf-8") as f:
-                    json.dump(saved_tokenizer_config, f, indent=2, ensure_ascii=False)
+            if "tokenizer_class" in saved_tokenizer_config:
+                config_tokenizer_class = saved_tokenizer_config.get("tokenizer_class")
+                if (not config_tokenizer_class.endswith("Fast")) and (
+                    isinstance(self.tokenizer.tokenizer, PreTrainedTokenizerFast)
+                    ):
+                    saved_tokenizer_config["tokenizer_class"] = saved_tokenizer_config["tokenizer_class"] + "Fast"
+                    with open(os.path.join(save_dir, "tokenizer_config.json"), "w", encoding="utf-8") as f:
+                        json.dump(saved_tokenizer_config, f, indent=2, ensure_ascii=False)
 
 
     cls.save_quantized = save_quantized
 
     def get_model_with_quantize(self, qcfg, model_id_or_path):
-        # ADDED: Check if the model class is a Hugging Face model.
         is_hf_model = getattr(self, "is_hf_model", True)
 
         if not is_hf_model:
-            # ADDED: This path is not supported for generic models
             raise NotImplementedError(
                 "The `get_model_with_quantize` method (used when saving a model loaded from a quantized state) "
                 "is not supported for non-HuggingFace models."
             )
         
-        # --- START OF ORIGINAL HUGGING FACE LOGIC (UNTOUCHED) ---
         config = AutoConfig.from_pretrained(
             model_id_or_path,
             trust_remote_code=True,
@@ -315,7 +318,7 @@ def ModelWriter(cls):
                 config, torch_dtype=torch.float16
             )
 
-            if self.dynamic_expert_index is not None:
+            if hasattr(self, 'dynamic_expert_index') and self.dynamic_expert_index is not None:
                 num_experts = getattr(config, self.dynamic_expert_index)
                 _ = get_moe_layer_modules(layer_modules=self.layer_modules,
                                                       num_experts=num_experts)
