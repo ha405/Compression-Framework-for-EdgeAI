@@ -1,6 +1,6 @@
 # auto_gptq/modeling/resnet.py
 
-from typing import List, Dict, Union
+from typing import List, Dict, Union, Tuple
 
 import torch
 import torch.nn as nn
@@ -41,17 +41,18 @@ class ResNet50GPTQ(BaseGPTQModel):
     modality = [MODALITY.IMAGE]
     require_load_processor = False
 
-    def get_layers(self, model: nn.Module) -> nn.ModuleList:
+    def get_layers(self, model: nn.Module) -> List[Tuple[str, nn.Module]]:
         """
         Overrides the default layer-finding mechanism to correctly handle the
-        ResNet architecture by collecting blocks from layer1, layer2, layer3, and layer4.
+        ResNet architecture by collecting blocks AND THEIR NAMES from the model.
         """
-        all_blocks = []
-        all_blocks.extend(model.layer1)
-        all_blocks.extend(model.layer2)
-        all_blocks.extend(model.layer3)
-        all_blocks.extend(model.layer4)
-        return nn.ModuleList(all_blocks)
+        named_blocks = []
+        for stage_name in ["layer1", "layer2", "layer3", "layer4"]:
+            stage = getattr(model, stage_name)
+            for i, block in enumerate(stage):
+                named_blocks.append((f"{stage_name}.{i}", block))
+        
+        return named_blocks
 
     def prepare_dataset(
         self,
