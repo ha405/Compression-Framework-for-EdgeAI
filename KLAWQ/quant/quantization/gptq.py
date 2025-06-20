@@ -55,17 +55,16 @@ lock = threading.Lock()
 def get_number_of_rows_and_cols(layer: nn.Module):
     if isinstance(layer, NamedModule):
         layer = layer.module
-    # Use isinstance() for safer type checking
-    if isinstance(layer, transformers.Conv1D): # Check the imported Conv1D type
-        return layer.weight.shape[1], layer.weight.shape[0]
-    elif isinstance(layer, (nn.Linear, nn.Conv2d)):
-        # Use NumPy prod for safety if needed, though torch.prod exists
-        return layer.weight.shape[0], int(np.prod(layer.weight.shape[1:]))
+        
+    # MODIFIED: Use _ConvNd for generic convolution handling
+    if isinstance(layer, (nn.Linear, Conv1D)):
+        return layer.weight.shape[1], layer.weight.shape[0] if isinstance(layer, Conv1D) else layer.weight.shape[0]
+    elif isinstance(layer, _ConvNd): # This handles Conv1d, Conv2d, etc.
+        return layer.weight.shape[0], int(torch.prod(torch.tensor(layer.weight.shape[1:])))
     else:
-        # Fallback for potential custom linear layers if they have .weight
         if hasattr(layer, 'weight') and isinstance(layer.weight, torch.Tensor) and layer.weight.ndim >= 2:
              log.warning(f"Attempting fallback shape calculation for layer type: {type(layer)}")
-             return layer.weight.shape[0], int(np.prod(layer.weight.shape[1:]))
+             return layer.weight.shape[0], int(torch.prod(torch.tensor(layer.weight.shape[1:])))
         raise TypeError(f"Unsupported layer type for get_number_of_rows_and_cols: {type(layer)}")
 
 class GPTQ:
@@ -111,10 +110,11 @@ class GPTQ:
 
     @staticmethod
     def _validate_module(module):
-        supported_types = (nn.Linear, nn.Conv2d, transformers.Conv1D)
+        # MODIFIED: Use _ConvNd for generic convolution handling
+        supported_types = (nn.Linear, _ConvNd, Conv1D)
         if not isinstance(module, supported_types):
              if not (hasattr(module, 'weight') and isinstance(module.weight, torch.Tensor)):
-                  raise TypeError(f"GPTQ supports Linear, Conv2d, transformers.Conv1D. Found: {type(module)}")
+                  raise TypeError(f"GPTQ supports Linear, ConvNd, and transformers.Conv1D. Found: {type(module)}")
              else: log.warning(f"Module {type(module)} not explicitly supported but has .weight.")
 
     def create_quantizer(self, name: str) -> Quantizer:
@@ -125,8 +125,11 @@ class GPTQ:
         source_weight = source_module.weight.data
         if source_weight.device == target_device: clone = source_weight.clone()
         else: clone = source_weight.to(device=target_device, copy=True)
-        if isinstance(source_module, nn.Conv2d): clone = clone.flatten(1)
-        elif isinstance(source_module, transformers.Conv1D): clone = clone.t()
+        # MODIFIED: Use _ConvNd for generic convolution handling
+        if isinstance(source_module, _ConvNd): 
+            clone = clone.flatten(1)
+        elif isinstance(source_module, Conv1D): 
+            clone = clone.t()
         return clone.float()
 
     @torch.inference_mode()
@@ -181,10 +184,10 @@ class GPTQ:
         inp_compute = inp.to(device=self.compute_device, dtype=torch.float32)
 
         original_shape = inp_compute.shape; reshaped_inp = None; source_module = self.module
-        if isinstance(source_module, (nn.Linear, transformers.Conv1D)):
+        if isinstance(source_module, (nn.Linear, Conv1D)):
             if inp_compute.ndim > 2: reshaped_inp = inp_compute.reshape(-1, original_shape[-1])
             else: reshaped_inp = inp_compute
-        elif isinstance(source_module, nn.Conv2d):
+        elif isinstance(source_module, nn.Conv2d): # This is specific, using _ConvNd would be too broad here
             unfolded_inp = F.unfold(inp_compute, kernel_size=source_module.kernel_size, dilation=source_module.dilation, padding=source_module.padding, stride=source_module.stride)
             reshaped_inp = unfolded_inp.permute(0, 2, 1).reshape(-1, unfolded_inp.shape[1])
         else:
@@ -358,15 +361,13 @@ class GPTQ:
                 q = current_quantizer.quantize(w.unsqueeze(1)).flatten(); Q1[:, i] = q
                 Losses1[:, i] = (w - q) ** 2 / d**2
                 err1 = (w - q) / d
-
-                # *** DEBUG PRINTS REMOVED ***
+                
                 if i + 1 < count:
                     W1[:, i+1:] -= err1.unsqueeze(1).matmul(Hinv1[i, i+1:].unsqueeze(0))
                 Err1[:, i] = err1
 
             Q[:, i1:i2] = Q1; Losses[:, i1:i2] = Losses1 / 2
             if i2 < self.columns:
-                 # *** DEBUG PRINTS REMOVED ***
                  W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
 
@@ -390,12 +391,13 @@ class GPTQ:
         if self.qcfg.desc_act:
             if invperm is None: raise RuntimeError("invperm is None for unpermute")
             Q = Q[:, invperm]
-            # *** FIX: Move invperm to CPU before indexing g_idx ***
             g_idx = g_idx[invperm.to(CPU)]
 
-        if isinstance(self.module, transformers.Conv1D): Q = Q.t()
-        if Q.shape != self.W_ref.shape: Q = Q.reshape(self.W_ref.shape).to(dtype=self.W_ref.dtype)
-        else: Q = Q.to(dtype=self.W_ref.dtype)
+        if isinstance(self.module, Conv1D): Q = Q.t()
+        if Q.shape != self.W_ref.shape:
+             Q = Q.reshape(self.W_ref.shape).to(dtype=self.W_ref.dtype)
+        else:
+             Q = Q.to(dtype=self.W_ref.dtype)
         Q = Q.to(device=self.compute_device)
 
         if not scale: scale.append(self.quantizer.scale); zero.append(self.quantizer.zero)

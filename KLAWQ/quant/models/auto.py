@@ -1,3 +1,5 @@
+# auto_gptq/modeling/__init__.py
+
 import os
 
 import threadpoolctl
@@ -31,6 +33,8 @@ import numpy
 import torch
 from huggingface_hub import list_repo_files
 from tokenicer import Tokenicer
+# MODIFIED: Import nn to check for non-HF models
+import torch.nn as nn
 from transformers import AutoConfig, GenerationConfig, PreTrainedModel, PreTrainedTokenizerBase
 
 from ..nn_modules.qlinear.torch import TorchQuantLinear
@@ -68,7 +72,7 @@ from .definitions.qwen2_moe import Qwen2MoeGPTQ
 from .definitions.qwen2_vl import Qwen2VLGPTQ
 from .definitions.qwen3 import Qwen3GPTQ
 from .definitions.qwen3_moe import Qwen3MoeGPTQ
-
+from .definitions.resnet import ResNet50GPTQ
 torch.manual_seed(787)
 random.seed(787)
 numpy.random.seed(787)
@@ -93,17 +97,23 @@ MODEL_MAP = {
     "deepseek_v3": DeepSeekV3GPTQ,
     "mllama": MLlamaGPTQ,
     "mobilellm": MobileLLMGPTQ,
+    "resnet50": ResNet50GPTQ, # This line from you is correct and necessary
 }
 
 SUPPORTED_MODELS = list(MODEL_MAP.keys())
 
 
 def check_and_get_model_type(model_dir, trust_remote_code=False):
-    config = AutoConfig.from_pretrained(model_dir, trust_remote_code=trust_remote_code)
-    if config.model_type.lower() not in SUPPORTED_MODELS:
-        raise TypeError(f"{config.model_type} isn't supported yet.")
-    model_type = config.model_type
-    return model_type.lower()
+    # This function is now only called for Hugging Face models.
+    try:
+        config = AutoConfig.from_pretrained(model_dir, trust_remote_code=trust_remote_code)
+        if config.model_type not in SUPPORTED_MODELS:
+            raise TypeError(f"{config.model_type} isn't supported yet.")
+        model_type = config.model_type
+        return model_type.lower()
+    except Exception as e:
+        raise ValueError(f"Could not determine model type for {model_dir}. Please provide `model_type` argument. Error: {e}")
+
 
 class GPTQModel:
     def __init__(self):
@@ -131,10 +141,15 @@ class GPTQModel:
             backend = BACKEND(backend)
 
         is_quantized = False
-        if hasattr(AutoConfig.from_pretrained(model_id_or_path, trust_remote_code=trust_remote_code),
-                   "quantization_config"):
-            is_quantized = True
-        else:
+        try:
+            # MODIFIED: Wrap in try-except for non-HF models
+            if hasattr(AutoConfig.from_pretrained(model_id_or_path, trust_remote_code=trust_remote_code),
+                       "quantization_config"):
+                is_quantized = True
+        except Exception:
+            pass # Fails for models like resnet50, which is expected.
+
+        if not is_quantized:
             for name in [QUANT_CONFIG_FILENAME, "quant_config.json"]:
                 if isdir(model_id_or_path):
                     if os.path.exists(join(model_id_or_path, name)):
@@ -142,11 +157,15 @@ class GPTQModel:
                         break
 
                 else:
-                    files = list_repo_files(repo_id=model_id_or_path)
-                    for f in files:
-                        if f == name:
-                            is_quantized = True
-                            break
+                    # MODIFIED: Handle cases where model_id_or_path is not a repo
+                    try:
+                        files = list_repo_files(repo_id=model_id_or_path)
+                        for f in files:
+                            if f == name:
+                                is_quantized = True
+                                break
+                    except Exception:
+                        pass # Fails for local paths or non-repo models, which is fine.
 
         if is_quantized:
             return cls.from_quantized(
@@ -174,20 +193,35 @@ class GPTQModel:
             model_id_or_path: str,
             quantize_config: QuantizeConfig,
             trust_remote_code: bool = False,
+            # ADDED: New argument to manually specify the model type
+            model_type: Optional[str] = None,
             **model_init_kwargs,
     ) -> BaseGPTQModel:
-        if hasattr(AutoConfig.from_pretrained(model_id_or_path, trust_remote_code=trust_remote_code),
-                   "quantization_config"):
-            log.warn("Model is already quantized, will use `from_quantized` to load quantized model.\n"
-                           "If you want to quantize the model, please pass un_quantized model path or id, and use "
-                           "`from_pretrained` with `quantize_config`.")
-            return cls.from_quantized(model_id_or_path, trust_remote_code=trust_remote_code)
+        # MODIFIED: Check if model is a HF model before checking for quantization config
+        try:
+            config = AutoConfig.from_pretrained(model_id_or_path, trust_remote_code=trust_remote_code)
+            if hasattr(config, "quantization_config"):
+                log.warn("Model is already quantized, will use `from_quantized` to load quantized model.\n"
+                               "If you want to quantize the model, please pass un_quantized model path or id, and use "
+                               "`from_pretrained` with `quantize_config`.")
+                return cls.from_quantized(model_id_or_path, trust_remote_code=trust_remote_code, model_type=model_type)
+        except Exception:
+            pass # Not a Hugging Face model, proceed.
+
 
         if quantize_config and quantize_config.dynamic:
             log.warn(
                 "GPTQModel's per-module `dynamic` quantization feature is fully supported in latest vLLM and SGLang but not yet available in hf transformers.")
+        
+        # MODIFIED: Use the user-provided model_type if available, otherwise detect it.
+        if not model_type:
+            log.info("model_type not specified, trying to auto-detect from config...")
+            model_type = check_and_get_model_type(model_id_or_path, trust_remote_code)
+        
+        log.info(f"Using model type: {model_type}")
+        if model_type not in MODEL_MAP:
+            raise ValueError(f"Unsupported model type '{model_type}'. Supported types: {list(MODEL_MAP.keys())}")
 
-        model_type = check_and_get_model_type(model_id_or_path, trust_remote_code)
         return MODEL_MAP[model_type].from_pretrained(
             pretrained_model_id_or_path=model_id_or_path,
             quantize_config=quantize_config,
@@ -204,10 +238,18 @@ class GPTQModel:
             backend: Union[str, BACKEND] = BACKEND.AUTO,
             trust_remote_code: bool = False,
             verify_hash: Optional[Union[str, List[str]]] = None,
+            # ADDED: New argument to manually specify the model type
+            model_type: Optional[str] = None,
             **kwargs,
     ) -> BaseGPTQModel:
-
-        model_type = check_and_get_model_type(model_id_or_path, trust_remote_code)
+        # MODIFIED: Use the user-provided model_type if available, otherwise detect it.
+        if not model_type:
+            log.info("model_type not specified, trying to auto-detect from config...")
+            model_type = check_and_get_model_type(model_id_or_path, trust_remote_code)
+        
+        log.info(f"Using model type: {model_type}")
+        if model_type not in MODEL_MAP:
+            raise ValueError(f"Unsupported model type '{model_type}'. Supported types: {list(MODEL_MAP.keys())}")
 
         if isinstance(backend, str):
             backend = BACKEND(backend)

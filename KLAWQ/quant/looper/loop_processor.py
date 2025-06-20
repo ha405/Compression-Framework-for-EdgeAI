@@ -90,7 +90,8 @@ class LoopProcessor:
                 raise ValueError("Calibration dataset must not be empty.")
 
             min_calibration_dataset_size = 256
-            min_calibration_dataset_input_ids_avg_length = 256
+            # MODIFIED: Text-specific warnings are not always relevant
+            # min_calibration_dataset_input_ids_avg_length = 256 
             if len(calibration_dataset) < min_calibration_dataset_size:
                 log.warn(f"Calibration dataset size should be more than {min_calibration_dataset_size}. "
                                f"Current: {len(calibration_dataset)}.")
@@ -98,29 +99,40 @@ class LoopProcessor:
             calibration_dataset = prepare_dataset_func(calibration_dataset=calibration_dataset,
                                                             calibration_dataset_concat_size=calibration_dataset_concat_size,
                                                             batch_size=batch_size)
-
-            total_input_ids_length = 0
-            max_input_id_length = 0
+            
+            # --- START OF MODIFIED VALIDATION BLOCK ---
+            # This logic is now generic and works for both text and image models.
+            total_elements = 0
+            is_text_data = True # Assume text by default unless we find other data types
             for row in calibration_dataset:
-                input_ids = row["input_ids"]
-                if isinstance(input_ids, torch.Tensor):
-                    if input_ids.dim() <= 2:
-                        input_ids_length = input_ids.shape[-1]
+                if "input_ids" in row:
+                    data = row["input_ids"]
+                    if isinstance(data, torch.Tensor):
+                        # For text, we are interested in the sequence length
+                        total_elements += data.shape[-1]
                     else:
-                        raise ValueError(
-                            "Expected a 1-dimensional tensor or 2-dimensional tensor for 'input_ids', but got a tensor with {0} dimensions.".format(
-                                input_ids.dim()))
+                        total_elements += len(data)
                 else:
-                    input_ids_length = len(input_ids)
-
-                if input_ids_length > max_input_id_length:
-                    max_input_id_length = input_ids_length
-                total_input_ids_length += input_ids_length
-            avg = total_input_ids_length / len(calibration_dataset)
-
-            if avg < min_calibration_dataset_input_ids_avg_length:
-                log.warn(f"The average length of input_ids of calibration_dataset should be greater than "
-                               f"{min_calibration_dataset_input_ids_avg_length}: actual avg: {avg}.")
+                    is_text_data = False
+                    # For other modalities, we count the number of samples in the batch
+                    found_tensor = False
+                    for key, value in row.items():
+                        if isinstance(value, torch.Tensor):
+                            total_elements += value.shape[0] 
+                            found_tensor = True
+                            break 
+                    if not found_tensor:
+                        log.warn(f"Could not find a tensor in calibration data batch to verify size. Keys: {list(row.keys())}")
+            
+            avg = total_elements / len(calibration_dataset)
+            
+            # Only show the text-specific warning if we detected text data
+            if is_text_data:
+                min_calibration_dataset_input_ids_avg_length = 256
+                if avg < min_calibration_dataset_input_ids_avg_length:
+                    log.warn(f"The average length of input_ids of calibration_dataset should be greater than "
+                                   f"{min_calibration_dataset_input_ids_avg_length}: actual avg: {avg}.")
+            # --- END OF MODIFIED VALIDATION BLOCK ---
 
             self.num_batches = len(calibration_dataset)
 
@@ -224,6 +236,8 @@ class LoopProcessor:
 
     def set_calibration_dataset(self, calibration_dataset):
         pass
+
+
 
     def set_fwd_time(self, fwd_time: float):
         self.fwd_time = fwd_time
