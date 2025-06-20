@@ -494,10 +494,14 @@ def find_modules(module: nn.Module, layers=None, name: str="") -> Dict[str, nn.M
 
 
 def get_module_by_name_prefix(model, module_name: List[str]):
+    # MODIFIED: Handle case where module_name can be None
+    if module_name is None:
+        return None, None
     for name, module in model.named_modules():
         for prefix in module_name:
             if name.startswith(prefix):
                 return module, prefix
+    return None, None
 
 
 def get_module_by_name_suffix(model, module_name: str):
@@ -506,8 +510,13 @@ def get_module_by_name_suffix(model, module_name: str):
             return module
 
 def get_module(module, key):
+    # MODIFIED: Handle case where key can be None
+    if key is None:
+        return None
     name_list = key.split(".")
     for name in name_list:
+        if module is None:
+            return None
         module = getattr(module, name, None)
     return module
 
@@ -605,7 +614,7 @@ def create_quant_layer(
             in_features = submodule.in_features
             out_features = submodule.out_features
         elif isinstance(submodule, _ConvNd):
-            in_features = submodule.in_channels
+            in_features = int(torch.prod(torch.tensor(submodule.weight.shape[1:])))
             out_features = submodule.out_channels
         elif isinstance(submodule, transformers.Conv1D):
             in_features = submodule.weight.shape[0]
@@ -785,7 +794,8 @@ def simple_dispatch_model(model, device_map):
     if "" in device_map:
         d = device_map[""]
         model = model.to(torch.device(d))
-        model.hf_device_map = device_map
+        if hasattr(model, "hf_device_map"):
+            model.hf_device_map = device_map
         return model
     else:
         raise ValueError("internal device_map must contain an empty string")
@@ -883,7 +893,11 @@ def auto_dtype(config: PretrainedConfig,
     if device in [DEVICE.CPU]:
         log.info("Loader: Auto dtype (CPU): `torch.bfloat16`")
         return torch.bfloat16
-
+    
+    if config is None:
+        log.info("Loader: Auto dtype (no config): `torch.bfloat16`")
+        return torch.bfloat16
+    
     dtype = getattr(config, "torch_dtype")
     if dtype and not isinstance(dtype, torch.dtype):
         raise ValueError(f"torch_dtype in config must be a torch.dtype, but got {dtype}")
@@ -930,19 +944,25 @@ def check_to_quantized(config):
 def copy_py_files(save_dir, file_extension=".py", model_id_or_path=""):
     os.makedirs(save_dir, exist_ok=True)
 
+    # MODIFIED: Handle cases where model_id_or_path is not a directory (e.g., "resnet50")
     if os.path.isdir(model_id_or_path):
         py_files = [f for f in os.listdir(model_id_or_path) if f.endswith('.py')]
         for file in py_files:
             shutil.copy2(os.path.join(model_id_or_path, file), save_dir)
     else:
-        api = HfApi()
-        model_info = api.model_info(model_id_or_path)
-        for file in model_info.siblings:
-            if file.rfilename.endswith(file_extension):
-                _ = hf_hub_download(repo_id=model_id_or_path, filename=file.rfilename,
-                                                  local_dir=save_dir)
+        # MODIFIED: Wrap in a try-except block to gracefully handle non-repo IDs
+        try:
+            api = HfApi()
+            model_info = api.model_info(model_id_or_path)
+            for file in model_info.siblings:
+                if file.rfilename.endswith(file_extension):
+                    _ = hf_hub_download(repo_id=model_id_or_path, filename=file.rfilename,
+                                                    local_dir=save_dir)
+        except Exception:
+            log.info(f"Skipping copy_py_files for non-local, non-hub model: {model_id_or_path}")
 
 def get_model_files_size(pre_quantized_model_path, file_extension=['.bin', '.safetensors', '.pth', '.pt', '.ckpt', '.h5', '.pb', '.onnx']):
+    # MODIFIED: Handle cases where model_id_or_path is not a directory (e.g., "resnet50")
     if os.path.isdir(pre_quantized_model_path):
         pre_quantized_size_bytes = sum(
             os.path.getsize(os.path.join(pre_quantized_model_path, f))
@@ -951,15 +971,22 @@ def get_model_files_size(pre_quantized_model_path, file_extension=['.bin', '.saf
                 1] in file_extension
         )
     else:
-        api = HfApi()
-        files_data = api.list_repo_files(pre_quantized_model_path)
-        pre_quantized_size_bytes = 0
-        for file_info in files_data:
-            if any(file_info.endswith(ext) for ext in file_extension):
-                file_metadata = api.model_info(pre_quantized_model_path, files_metadata=True)
-                for file_data in file_metadata.siblings:
-                    if file_data.rfilename == file_info:
-                        pre_quantized_size_bytes += file_data.size
+        # MODIFIED: Wrap in a try-except block to gracefully handle non-repo IDs
+        try:
+            api = HfApi()
+            files_data = api.list_repo_files(pre_quantized_model_path)
+            pre_quantized_size_bytes = 0
+            for file_info in files_data:
+                if any(file_info.endswith(ext) for ext in file_extension):
+                    file_metadata = api.model_info(pre_quantized_model_path, files_metadata=True)
+                    for file_data in file_metadata.siblings:
+                        if file_data.rfilename == file_info:
+                            pre_quantized_size_bytes += file_data.size
+        except Exception:
+            # Fallback for when path is neither a local dir nor a Hub ID (like "resnet50")
+            log.warning(f"Could not get model file size for '{pre_quantized_model_path}'. It is not a local directory or a valid HuggingFace Hub ID. Returning 0.")
+            pre_quantized_size_bytes = 0
+
     pre_quantized_size_mb = pre_quantized_size_bytes / (1024 * 1024)
     return pre_quantized_size_mb
 
@@ -980,9 +1007,9 @@ def check_requires_version(requires_version, current_version):
     else:
         return None
 
-
 class MODALITY(str, Enum):
     TEXT = "text"
+    IMAGE = "image"
     IMAGE_TO_TEXT = "image_to_text"
 
 
@@ -999,7 +1026,8 @@ def get_state_dict_for_save(model: nn.Module) -> Dict:
     shared_ptrs = {ptr: names for ptr, names in ptrs.items() if len(names) > 1}
     warn_names = set()
     for names in shared_ptrs.values():
-        if model._tied_weights_keys is not None:
+        # MODIFIED: Add hasattr check for _tied_weights_keys
+        if hasattr(model, '_tied_weights_keys') and model._tied_weights_keys is not None:
             found = 0
             for name in sorted(names):
                 matches_pattern = any(re.search(pat, name) for pat in model._tied_weights_keys)
@@ -1016,11 +1044,12 @@ def get_state_dict_for_save(model: nn.Module) -> Dict:
                     del state_dict[name]
                     warn_names.add(name)
     if len(warn_names) > 0:
-        log.warn.once(
+        log.warn(
             f"Removed shared tensor {warn_names} while saving. This should be OK, but check by verifying that you don't receive any warning while reloading",
         )
     return state_dict
 
 def load_checkpoint_in_model_then_tie_weights(model, *args, **kwargs):
     accelerate.load_checkpoint_in_model(model, *args, **kwargs)
-    model.tie_weights()
+    if hasattr(model, 'tie_weights'):
+      model.tie_weights()
