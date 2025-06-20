@@ -204,6 +204,11 @@ def ModelLoader(cls):
             # ADDED: Generic Model (e.g., torchvision) Loading Logic
             log.info(f"Loading non-HuggingFace model '{pretrained_model_id_or_path}' using the specified loader.")
             model_local_path = pretrained_model_id_or_path
+
+            if quantize_config.device is None:
+                quantize_config.device = auto_select_device(None, None)
+            else:
+                quantize_config.device = normalize_device(quantize_config.device)
             
             def skip(*args, **kwargs):
                 pass
