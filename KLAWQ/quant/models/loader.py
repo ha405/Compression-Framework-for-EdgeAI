@@ -146,6 +146,11 @@ def ModelLoader(cls):
 
             model_local_path = get_model_local_path(pretrained_model_id_or_path, **model_init_kwargs)
 
+            if quantize_config.device is None:
+                quantize_config.device = auto_select_device(None, None)
+            else:
+                quantize_config.device = normalize_device(quantize_config.device)
+
             def skip(*args, **kwargs):
                 pass
 
