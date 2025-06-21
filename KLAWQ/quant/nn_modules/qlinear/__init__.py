@@ -352,6 +352,7 @@ class PackableQuantLinear(BaseQuantLinear):
         ]
 
     def dequantize_weight(self, num_itr: int = 1):
+        # 1) Extract zeros & weight bits
         if self.bits in [2, 4, 8]:
             zeros = t.bitwise_right_shift(
                 t.unsqueeze(self.qzeros, 2).expand(-1, -1, self.pack_factor),
@@ -387,50 +388,39 @@ class PackableQuantLinear(BaseQuantLinear):
             weight[:, 1, 11] = (weight[:, 1, 11] & 0x1) | ((weight[:, 2, 0] << 1) & 0x6)
             weight = weight & 0x7
             weight = t.cat([weight[:, 0, :11], weight[:, 1, 1:12], weight[:, 2, 1:11]], dim=1)
+
+        # Flatten to (in_features, out_features)
         weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
 
-        # --- START OF THE DEFINITIVE FIX ---
+        # 2) Apply scales & zeros per-group without broadcast mismatch
         if self.desc_act:
-            # If act-order is used, g_idx will be used to unscramble.
+            # legacy behavior: use g_idx
             weights = self.scales[self.g_idx.long()] * (weight - zeros[self.g_idx.long()])
         else:
-            # If not using act-order, g_idx is a simple range. We can avoid indexing
-            # and use reshaping and broadcasting, which is more robust.
-            
-            # The scales and zeros are per-group.
-            # scales shape: (num_groups, out_features)
-            # zeros shape:  (num_groups, out_features)
-            # weight shape: (in_features, out_features)
-            
-            # We expand scales and zeros to match the weight tensor's in_features dimension.
-            # The `repeat_interleave` function will repeat each row (each group's parameters) `group_size` times.
+            # robust per-group expansion
             num_groups = math.ceil(self.in_features / self.group_size)
-            
-            # This handles the last group which might not be full
             full_groups = self.in_features // self.group_size
-            last_group_size = self.in_features % self.group_size
-            
-            if last_group_size == 0:
-                # No remainder, all groups are full
-                repeat_counts = t.tensor([self.group_size] * num_groups, device=self.scales.device, dtype=t.long)
+            last_group = self.in_features % self.group_size
+            if last_group == 0:
+                reps = [self.group_size] * num_groups
             else:
-                repeat_counts = t.tensor([self.group_size] * full_groups + [last_group_size], device=self.scales.device, dtype=t.long)
-            
-            # This check is needed because the `scales` and `zeros` buffers might be padded
-            # to be multiples of some internal pack size. We only want to repeat for the
-            # actual number of groups we have.
-            if self.scales.shape[0] != len(repeat_counts):
-                scales = self.scales[:len(repeat_counts)]
-                zeros = zeros[:len(repeat_counts)]
-            else:
-                scales = self.scales
-            
-            expanded_scales = scales.repeat_interleave(repeat_counts, dim=0)
-            expanded_zeros = zeros.repeat_interleave(repeat_counts, dim=0)
+                reps = [self.group_size] * full_groups + [last_group]
 
-            # Slicing ensures we match the exact in_features dimension
-            weights = expanded_scales[:self.in_features] * (weight - expanded_zeros[:self.in_features])
-        # --- END OF THE DEFINITIVE FIX ---
+            # Trim buffers to actual groups
+            scales = self.scales[: len(reps)]
+            zeros = zeros[: len(reps)]
+
+            # Expand to per-weight length
+            counts = t.tensor(reps, device=scales.device, dtype=t.long)
+            exp_scales = scales.repeat_interleave(counts, dim=0)
+            exp_zeros = zeros.repeat_interleave(counts, dim=0)
+
+            # Slice to exact in_features
+            exp_scales = exp_scales[: self.in_features]
+            exp_zeros = exp_zeros[: self.in_features]
+
+            # Compute final dequantized weights
+            weights = exp_scales * (weight - exp_zeros)
 
         return weights
 
