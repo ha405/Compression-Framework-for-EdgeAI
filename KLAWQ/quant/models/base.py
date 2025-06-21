@@ -1,5 +1,3 @@
-# auto_gptq/modeling/base.py
-
 from __future__ import annotations
 
 import copy
@@ -13,7 +11,6 @@ import torch._dynamo
 import torch.nn as nn
 from packaging.version import Version
 from tokenicer import Tokenicer
-# MODIFIED: Added check for PreTrainedModel to handle different model types
 from transformers import (AutoModelForCausalLM, AutoProcessor, PreTrainedModel,
                           PreTrainedTokenizerBase, ProcessorMixin, modeling_utils)
 
@@ -41,14 +38,13 @@ PYTORCH_MIN_VERSION_WITH_COMPILE = Version(TORCH_MIN_VERSION_STR)
 def check_support_param_buffer_assignment(*args, **kwargs):
     return False
 
-
 modeling_utils.check_support_param_buffer_assignment = check_support_param_buffer_assignment
 
 log = setup_logger()
 
 class BaseGPTQModel(nn.Module):
     base_modules: List[str] = None
-
+    is_hf_model: bool = True # Default to True for backward compatibility
     lm_head: str = "lm_head"
 
     layers_node: str = None
@@ -84,10 +80,19 @@ class BaseGPTQModel(nn.Module):
     quant_override_files: Dict[str, Union[str | Dict[str, Any]]] = {}
 
     server = None
+    
+    # --- START OF THE DEFINITIVE FIX ---
+    @property
+    def device(self) -> torch.device:
+        """
+        Returns the device on which the model is currently located.
+        This is a robust way to get the device for any nn.Module.
+        """
+        return next(self.model.parameters()).device
+    # --- END OF THE DEFINITIVE FIX ---
 
     def __init__(
         self,
-        # MODIFIED: Changed type hint to be more generic
         model: nn.Module,
         quantized: bool,
         quantize_config: QuantizeConfig,
@@ -98,22 +103,18 @@ class BaseGPTQModel(nn.Module):
         model_local_path: str = None,
     ):
         super().__init__()
-
         self.model = model
-
         self.compiled = False
         self.quantized = quantized
         self.qlinear_kernel = qlinear_kernel
         self.load_quantized_model = load_quantized_model
         
-        # MODIFIED: Added a check to handle models without tokenizers (e.g., vision models)
         if tokenizer is not None:
             if isinstance(tokenizer, PreTrainedTokenizerBase):
                 self.tokenizer = Tokenicer.load(tokenizer, trust_remote_code=trust_remote_code)
             else:
                 raise ValueError(
                     f"Unsupported `tokenizer` type: Expected `PreTrainedTokenizerBase`, actual = `{type(tokenizer)}`.")
-            # MODIFIED: Ensure model is a PreTrainedModel before assigning tokenizer to it
             if isinstance(self.model, PreTrainedModel):
                 self.model.tokenizer = self.tokenizer.tokenizer
         else:
@@ -125,7 +126,6 @@ class BaseGPTQModel(nn.Module):
             autofix_hf_model_config(self.model, path=model_local_path)
 
         self.quantize_config = quantize_config
-
         self.trust_remote_code = trust_remote_code
         self.model_local_path = model_local_path
         self.quant_log = []
@@ -136,9 +136,11 @@ class BaseGPTQModel(nn.Module):
 
         if self.require_monkeypatch:
             self.monkey_patch()
+        
+        if self.quantized:
+            log.info(f"Kernel: loaded -> `[{', '.join(cls.__name__ for cls in self.kernels())}]`")
 
-        log.info(f"Kernel: loaded -> `[{', '.join(cls.__name__ for cls in self.kernels())}]`")
-
+    # ... (rest of the file is unchanged) ...
     def prepare_dataset(
         self,
         calibration_dataset: Union[List[Dict[str, Union[List[int], torch.LongTensor]]], List[str], List[int]],
@@ -342,7 +344,6 @@ class BaseGPTQModel(nn.Module):
 
     def generate(self, inputs=None, **kwargs):
         with torch.inference_mode():
-            # MODIFIED: Check if model supports the 'generate' method.
             if not hasattr(self.model, 'generate'):
                 log.error(f"The loaded model ({self.model.__class__.__name__}) does not support the `.generate()` method. Please use a direct forward pass, e.g., `model(inputs)`.")
                 return
@@ -353,7 +354,7 @@ class BaseGPTQModel(nn.Module):
 
             if isinstance(inputs, str) or (isinstance(inputs, list) and all(isinstance(x, str) for x in inputs)):
                 if self.tokenizer is None:
-                    raise ValueError("You passed in an `input` to `generate()` of type `str` but model is missing a tokenizer.")
+                    raise ValueError("You passed in an `input` to `generate()` of type `str` but model is missing `model.tokenizer`.")
                 inputs = self.tokenizer(inputs, return_tensors="pt", padding=True, padding_side="left").to(self.model.device)
                 return self.model.generate(**inputs, **kwargs)
 
@@ -394,11 +395,9 @@ class BaseGPTQModel(nn.Module):
                     else:
                         f.write(json.dumps(value))
         else:
-            # MODIFIED: Handle saving for both HF models and generic nn.Module models.
             if isinstance(self.model, PreTrainedModel):
                 self.save_pretrained(save_dir=save_dir, **kwargs)
             else:
-                # ADDED: Logic to save generic torch models.
                 log.info(f"Model is not a PreTrainedModel. Saving state_dict to `{os.path.join(save_dir, 'model.pth')}`.")
                 if not os.path.exists(save_dir):
                     os.makedirs(save_dir)
