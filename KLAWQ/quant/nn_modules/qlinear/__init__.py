@@ -352,12 +352,25 @@ class PackableQuantLinear(BaseQuantLinear):
         ]
 
     def dequantize_weight(self, num_itr: int = 1):
-        # 1) Extract zeros & weight bits
+        import torch as t
+        import math
+
+        print("\n[DEBUG] Starting dequantize_weight()")
+        print(f"[DEBUG] bits: {self.bits}")
+        print(f"[DEBUG] qweight shape: {self.qweight.shape}")
+        print(f"[DEBUG] qzeros shape: {self.qzeros.shape}")
+        print(f"[DEBUG] scales shape: {self.scales.shape}")
+        print(f"[DEBUG] group_size: {self.group_size}")
+        print(f"[DEBUG] in_features: {self.in_features}")
+        print(f"[DEBUG] desc_act: {self.desc_act}")
+
+        # Step 1: Extract weight & zero values
         if self.bits in [2, 4, 8]:
             zeros = t.bitwise_right_shift(
                 t.unsqueeze(self.qzeros, 2).expand(-1, -1, self.pack_factor),
                 self.wf_unsqueeze_zero
             ).to(self.dequant_dtype)
+
             zeros = t.bitwise_and(zeros, self.maxq).reshape(self.scales.shape)
 
             weight = t.bitwise_and(
@@ -389,40 +402,54 @@ class PackableQuantLinear(BaseQuantLinear):
             weight = weight & 0x7
             weight = t.cat([weight[:, 0, :11], weight[:, 1, 1:12], weight[:, 2, 1:11]], dim=1)
 
-        # Flatten to (in_features, out_features)
+        # Step 2: Flatten weight
         weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
+        print(f"[DEBUG] Flattened weight shape: {weight.shape}")
 
-        # 2) Apply scales & zeros per-group without broadcast mismatch
+        # Step 3: Apply scale & zero
         if self.desc_act:
-            # legacy behavior: use g_idx
-            weights = self.scales[self.g_idx.long()] * (weight - zeros[self.g_idx.long()])
+            print("[DEBUG] Using legacy desc_act method.")
+            g_idx = self.g_idx.long()
+            print(f"[DEBUG] g_idx shape: {g_idx.shape}")
+            weights = self.scales[g_idx] * (weight - zeros[g_idx])
         else:
-            # robust per-group expansion
+            print("[DEBUG] Using repeat_interleave for per-group dequantization.")
             num_groups = math.ceil(self.in_features / self.group_size)
             full_groups = self.in_features // self.group_size
             last_group = self.in_features % self.group_size
+            print(f"[DEBUG] num_groups: {num_groups}, full_groups: {full_groups}, last_group: {last_group}")
+
+            # Repeat counts
             if last_group == 0:
                 reps = [self.group_size] * num_groups
             else:
                 reps = [self.group_size] * full_groups + [last_group]
 
-            # Trim buffers to actual groups
+            print(f"[DEBUG] reps: {reps}")
+            counts = t.tensor(reps, device=self.scales.device, dtype=t.long)
+
+            # Slice to match reps
             scales = self.scales[: len(reps)]
             zeros = zeros[: len(reps)]
 
-            # Expand to per-weight length
-            counts = t.tensor(reps, device=scales.device, dtype=t.long)
+            print(f"[DEBUG] Pre-expansion shapes -> scales: {scales.shape}, zeros: {zeros.shape}")
             exp_scales = scales.repeat_interleave(counts, dim=0)
             exp_zeros = zeros.repeat_interleave(counts, dim=0)
 
-            # Slice to exact in_features
-            exp_scales = exp_scales[: self.in_features]
-            exp_zeros = exp_zeros[: self.in_features]
+            print(f"[DEBUG] Expanded scales shape: {exp_scales.shape}")
+            print(f"[DEBUG] Expanded zeros shape: {exp_zeros.shape}")
 
-            # Compute final dequantized weights
+            # Trim to match weight shape if needed (defensive coding)
+            exp_scales = exp_scales[:self.in_features]
+            exp_zeros = exp_zeros[:self.in_features]
+
+            if exp_scales.shape[0] != weight.shape[0]:
+                print(f"[WARN] Shape mismatch before dequant: exp_scales={exp_scales.shape}, weight={weight.shape}")
             weights = exp_scales * (weight - exp_zeros)
 
+        print(f"[DEBUG] Final dequantized weight shape: {weights.shape}")
         return weights
+
 
     def pack(self, linear: nn.Module, scales: t.Tensor, zeros: t.Tensor, g_idx: t.Tensor=None):
         W = linear.weight.data.clone()
