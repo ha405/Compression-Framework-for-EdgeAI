@@ -390,6 +390,7 @@ class PackableQuantLinear(BaseQuantLinear):
         weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
 
         # --- START OF THE DEFINITIVE FIX ---
+        # The original `if/else num_itr` block is removed. This new logic is robust.
         if self.desc_act:
             # If act-order is used, g_idx will be used to unscramble.
             # The scales and zeros are per-group, so we index them with the group index.
@@ -397,14 +398,31 @@ class PackableQuantLinear(BaseQuantLinear):
         else:
             # If not using act-order, g_idx is just a simple range.
             # We can reshape scales and zeros to broadcast correctly without indexing.
-            # Reshape scales and zeros to (num_groups, 1, out_features) to broadcast against
-            # a weight tensor that we can view as (num_groups, group_size, out_features).
-            num_groups = self.in_features // self.group_size
+            # This handles cases where in_features is not a multiple of group_size.
+            num_groups = self.scales.shape[0]
+            
+            # Reshape scales and zeros to (num_groups, 1, out_features)
             reshaped_scales = self.scales.reshape(num_groups, 1, self.out_features)
             reshaped_zeros = zeros.reshape(num_groups, 1, self.out_features)
-            reshaped_weight = weight.reshape(num_groups, self.group_size, self.out_features)
             
-            weights = (reshaped_scales * (reshaped_weight - reshaped_zeros)).reshape(self.in_features, self.out_features)
+            # View the weight as (num_groups, group_size, out_features)
+            # We need to handle the last group which might be smaller.
+            
+            # Pad the weight tensor if in_features is not divisible by group_size
+            if self.in_features % self.group_size != 0:
+                pad_len = self.group_size - (self.in_features % self.group_size)
+                # Pad with a value that won't affect the main data, e.g., 0.
+                # The dequantized value will be `scale * (0 - zero)`, which isn't ideal but won't corrupt main weights.
+                # A better approach would be to use a padding value that results in zero after dequantization, but that's complex.
+                # Padding with zero is a common simplification.
+                padded_weight = t.cat([weight, weight.new_zeros(pad_len, weight.shape[1])], dim=0)
+                reshaped_weight = padded_weight.reshape(num_groups, self.group_size, self.out_features)
+            else:
+                reshaped_weight = weight.reshape(num_groups, self.group_size, self.out_features)
+            
+            # Perform dequantization with broadcasting and then reshape back, slicing off padding.
+            dequantized_weight = (reshaped_scales * (reshaped_weight - reshaped_zeros)).reshape(-1, self.out_features)
+            weights = dequantized_weight[:self.in_features, :]
         # --- END OF THE DEFINITIVE FIX ---
 
         return weights
