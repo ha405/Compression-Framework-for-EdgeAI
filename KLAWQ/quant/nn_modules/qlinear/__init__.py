@@ -393,6 +393,7 @@ class PackableQuantLinear(BaseQuantLinear):
         W = linear.weight.data.clone()
         if isinstance(linear, _ConvNd): W = W.flatten(1)
         if isinstance(linear, transformers.pytorch_utils.Conv1D): W = W.T
+        
         self.g_idx = g_idx.clone() if g_idx is not None else self.g_idx
         
         scales = scales.T.contiguous()
@@ -416,34 +417,36 @@ class PackableQuantLinear(BaseQuantLinear):
         if linear.bias is not None:
             self.bias = linear.bias.clone().to(dtype=t.float16)
         
-        # Pad the int_weight tensor if in_features is not a multiple of pack_factor
+        int_weight = int_weight.T.contiguous()
+        
+        # Padding for non-divisible in_features
         padded_in_features = self.in_features
         if self.in_features % self.pack_factor != 0:
             padded_in_features += self.pack_factor - (self.in_features % self.pack_factor)
-            pad_len = padded_in_features - self.in_features
-            int_weight = t.cat([int_weight, int_weight.new_zeros(int_weight.shape[0], pad_len)], dim=1)
-        
-        int_weight = int_weight.T.contiguous()
+        if int_weight.shape[0] < padded_in_features:
+            pad_len = padded_in_features - int_weight.shape[0]
+            int_weight = t.cat([int_weight, int_weight.new_zeros(pad_len, int_weight.shape[1])], dim=0)
+
         int_weight = int_weight.numpy().astype(self.pack_np_math_dtype)
         
-        # The numpy bit-packing logic
         qweight = np.zeros((int_weight.shape[0] // self.pack_factor, int_weight.shape[1]), dtype=self.pack_np_math_dtype)
         if self.bits in [2, 4, 8]:
             for row in range(qweight.shape[0]):
                 for j in range(self.pack_factor): qweight[row] |= int_weight[row * self.pack_factor + j] << (self.bits * j)
         else: # bits == 3
-            i, row = 0, 0
-            while row < qweight.shape[0]:
-                for j in range(i, i + 10): qweight[row] |= int_weight[j] << (3 * (j - i));
-                i += 10; qweight[row] |= int_weight[i] << 30; row += 1
-                qweight[row] |= (int_weight[i] >> 2) & 1; i += 1
-                for j in range(i, i + 10): qweight[row] |= int_weight[j] << (3 * (j - i) + 1);
-                i += 10; qweight[row] |= int_weight[i] << 31; row += 1
-                qweight[row] |= (int_weight[i] >> 1) & 0x3; i += 1
-                for j in range(i, i + 10): qweight[row] |= int_weight[j] << (3 * (j - i) + 2);
-                i += 10; row += 1
+             i, row = 0, 0
+             while row < qweight.shape[0]:
+                 for j in range(i, i + 10): qweight[row] |= int_weight[j] << (3 * (j - i));
+                 i += 10; qweight[row] |= int_weight[i] << 30; row += 1
+                 qweight[row] |= (int_weight[i] >> 2) & 1; i += 1
+                 for j in range(i, i + 10): qweight[row] |= int_weight[j] << (3 * (j - i) + 1);
+                 i += 10; qweight[row] |= int_weight[i] << 31; row += 1
+                 qweight[row] |= (int_weight[i] >> 1) & 0x3; i += 1
+                 for j in range(i, i + 10): qweight[row] |= int_weight[j] << (3 * (j - i) + 2);
+                 i += 10; row += 1
+        
         self.qweight = t.from_numpy(qweight.astype(self.pack_np_dtype))
-
+        
         zeros = zeros.numpy().astype(self.pack_np_math_dtype)
         qzeros = np.zeros((zeros.shape[0], zeros.shape[1] // self.pack_factor), dtype=self.pack_np_math_dtype)
         if self.bits in [2, 4, 8]:
@@ -460,4 +463,5 @@ class PackableQuantLinear(BaseQuantLinear):
                 qzeros[:, col] |= (zeros[:, i] >> 1) & 0x3; i += 1
                 for j in range(i, i + 10): qzeros[:, col] |= zeros[:, j] << (3 * (j - i) + 2);
                 i += 10; col += 1
+        
         self.qzeros = t.from_numpy(qzeros.astype(self.pack_np_dtype))
