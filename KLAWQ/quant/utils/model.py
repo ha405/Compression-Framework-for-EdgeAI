@@ -680,6 +680,10 @@ def pack_module(name, qModules, quant_result: Dict[str, Dict[str, Any]], layers,
     with tctl.threadpool_limits(limits=1):
         r = quant_result[name]
         scale, zero, g_idx = r["scale"], r["zero"], r["g_idx"]
+        quantized_module = qModules[name]
+        original_module = layers[name]
+        if hasattr(quantized_module, 'set_conv_parameters_from_linear'):
+            quantized_module.set_conv_parameters_from_linear(original_module.module)
         qModules[name] = qModules[name].to(CPU)
         layers[name], scale, zero, g_idx = (
             layers[name].to(CPU),
