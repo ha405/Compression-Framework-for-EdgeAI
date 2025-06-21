@@ -82,6 +82,7 @@ class BaseQuantLinear(nn.Module):
     def optimize(self, **kwargs): self.optimized = True
     def train(self, mode=True): return super().train(mode)
 
+
 class PackableQuantLinear(BaseQuantLinear):
     def post_init(self, **kwargs):
         if self.bits in [2, 4, 8]: wf = t.tensor(list(range(0, self.pack_dtype_bits, self.bits)), dtype=t.int32).unsqueeze(0).to(self.g_idx.device)
@@ -99,7 +100,7 @@ class PackableQuantLinear(BaseQuantLinear):
             zeros = t.bitwise_and(zeros, self.maxq).reshape(self.scales.shape)
             weight = t.bitwise_right_shift(t.unsqueeze(self.qweight, 1).expand(-1, self.pack_factor, -1), self.wf_unsqueeze_neg_one)
             weight = t.bitwise_and(weight, self.maxq).reshape(-1, self.out_features)
-        else:
+        else: # bits == 3
             zeros = self.qzeros.reshape(self.qzeros.shape[0], self.qzeros.shape[1] // 3, 3, 1).expand(-1,-1,-1,12) >> self.wf_unsqueeze_zero
             zeros[:,:,0,10] = (zeros[:,:,0,10]&3)|((zeros[:,:,1,0]<<2)&4); zeros[:,:,1,11] = (zeros[:,:,1,11]&1)|((zeros[:,:,2,0]<<1)&6)
             zeros = t.cat([zeros[:,:,0,:11], zeros[:,:,1,1:12], zeros[:,:,2,1:11]], dim=2).reshape(self.scales.shape)
@@ -114,8 +115,10 @@ class PackableQuantLinear(BaseQuantLinear):
     def pack(self, linear: nn.Module, scales: t.Tensor, zeros: t.Tensor, g_idx: t.Tensor=None):
         # --- START OF THE DEFINITIVE FIX ---
         W = linear.weight.data.clone()
-        if isinstance(linear, _ConvNd): W = W.flatten(1)
-        if isinstance(linear, transformers.pytorch_utils.Conv1D): W = W.T
+        if isinstance(linear, _ConvNd):
+            W = W.flatten(1)
+        if isinstance(linear, transformers.pytorch_utils.Conv1D):
+            W = W.T
         
         self.g_idx = g_idx.clone() if g_idx is not None else self.g_idx
         
@@ -173,11 +176,12 @@ class PackableQuantLinear(BaseQuantLinear):
         
         self.qweight = t.from_numpy(qweight.astype(self.pack_np_dtype))
         
+        # Unpack zeros before bit-packing them
         unpacked_zeros = zeros.numpy().astype(self.pack_np_math_dtype)
         qzeros = np.zeros((unpacked_zeros.shape[0], unpacked_zeros.shape[1] // self.pack_factor), dtype=self.pack_np_math_dtype)
         if self.bits in [2, 4, 8]:
-            for row in range(qzeros.shape[0]):
-                for col in range(qzeros.shape[1]):
+            for row in range(qzeros.shape[0]): # Iterate through groups
+                for col in range(qzeros.shape[1]): # Iterate through packed columns
                      for j in range(self.pack_factor):
                         qzeros[row, col] |= unpacked_zeros[row, col * self.pack_factor + j] << (self.bits * (j % self.pack_factor))
         elif self.bits == 3:
