@@ -435,6 +435,14 @@ class PackableQuantLinear(BaseQuantLinear):
         exp_s = scales_og[:, g_idx_full]  # [out, in_total]
         exp_z = zeros_og[:,  g_idx_full]  # [out, in_total]
 
+        print(f"[DEBUG] W.shape      = {W.shape}")
+        print(f"[DEBUG] exp_s.shape  = {exp_s.shape}")
+        print(f"[DEBUG] exp_z.shape  = {exp_z.shape}")
+        print(f"[DEBUG] pack_factor  = {self.pack_factor}")
+        print(f"[DEBUG] group_size   = {self.group_size}")
+        print(f"[DEBUG] in_features  = {self.in_features}")
+        print(f"[DEBUG] kernel_elems = {kernel_elems}")
+
         # 5) Quantize: round(W / scale + zero)
         intW = t.round((W / exp_s) + exp_z).to(t.int32)
 
