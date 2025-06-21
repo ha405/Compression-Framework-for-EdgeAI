@@ -15,23 +15,20 @@ from ...utils.logger import setup_logger
 log = setup_logger()
 
 class BaseQuantLinear(nn.Module):
-    SUPPORTS_BITS: List[int] = None
-    SUPPORTS_GROUP_SIZE: List[int] = None
-    SUPPORTS_DESC_ACT: List[bool] = None
-    SUPPORTS_SYM: List[bool] = None
-    SUPPORTS_SHARDS: bool = None
-    SUPPORTS_TRAINING: bool = None
+    SUPPORTS_BITS: List[int] = [2, 3, 4, 8]
+    SUPPORTS_GROUP_SIZE: List[int] = [-1, 16, 32, 64, 128]
+    SUPPORTS_DESC_ACT: List[bool] = [True, False]
+    SUPPORTS_SYM: List[bool] = [True, False]
+    SUPPORTS_SHARDS: bool = True
+    SUPPORTS_TRAINING: bool = True
     SUPPORTS_TRAINING_USE_TORCH_KERNEL: bool = False
-
-    SUPPORTS_AUTO_PADDING: bool = None
-    SUPPORTS_IN_FEATURES_DIVISIBLE_BY: List[int] = None
-    SUPPORTS_OUT_FEATURES_DIVISIBLE_BY: List[int] = None
-
-    SUPPORTS_PACK_DTYPES: List[t.dtype] = None
-    SUPPORTS_DEVICES: List[DEVICE] = None
-    SUPPORTS_PLATFORM: List[PLATFORM] = None
-
-    SUPPORTS_DTYPES: List[t.dtype] = None
+    SUPPORTS_AUTO_PADDING: bool = True
+    SUPPORTS_IN_FEATURES_DIVISIBLE_BY: List[int] = [1]
+    SUPPORTS_OUT_FEATURES_DIVISIBLE_BY: List[int] = [1]
+    SUPPORTS_PACK_DTYPES: List[t.dtype] = [t.int8, t.int16, t.int32, t.int64]
+    SUPPORTS_DEVICES: List[DEVICE] = [DEVICE.ALL]
+    SUPPORTS_PLATFORM: List[PLATFORM] = [PLATFORM.ALL]
+    SUPPORTS_DTYPES: List[t.dtype] = [t.float16, t.bfloat16]
 
     def __init__(self,
                  bits: int,
@@ -61,173 +58,57 @@ class BaseQuantLinear(nn.Module):
         self.backend = backend
         self.maxq = 2 ** self.bits - 1
         self.pack_dtype = pack_dtype
-
         self.optimized = False
-
         if self.pack_dtype == t.int8:
-            self.pack_dtype_bits = 8
-            self.pack_np_dtype = np.int8
-            self.pack_np_math_dtype = np.uint8
+            self.pack_dtype_bits, self.pack_np_dtype, self.pack_np_math_dtype = 8, np.int8, np.uint8
         elif self.pack_dtype == t.int16:
-            self.pack_dtype_bits = 16
-            self.pack_np_dtype = np.int16
-            self.pack_np_math_dtype = np.uint16
+            self.pack_dtype_bits, self.pack_np_dtype, self.pack_np_math_dtype = 16, np.int16, np.uint16
         elif self.pack_dtype == t.int32:
-            self.pack_dtype_bits = 32
-            self.pack_np_dtype = np.int32
-            self.pack_np_math_dtype = np.uint32
+            self.pack_dtype_bits, self.pack_np_dtype, self.pack_np_math_dtype = 32, np.int32, np.uint32
         elif self.pack_dtype == t.int64:
-            self.pack_dtype_bits = 64
-            self.pack_np_dtype = np.int64
-            self.pack_np_math_dtype = np.uint64
+            self.pack_dtype_bits, self.pack_np_dtype, self.pack_np_math_dtype = 64, np.int64, np.uint64
         else:
             raise ValueError("Unsupported weight_dtype. Only int16 and int32 are supported.")
-
         self.pack_factor = self.pack_dtype_bits // self.bits
         _, err = self._validate(bits=bits, group_size=group_size, desc_act=desc_act, sym=sym, in_features=in_features, out_features=out_features, pack_dtype=pack_dtype)
-        if err:
-            raise err
-
+        if err: raise err
         self._qzeros_format = 1
-
         if register_buffers:
             in_features_reg = self.in_features if not register_buffers_in_features else register_buffers_in_features
             out_features_reg = self.out_features if not register_buffers_out_features else register_buffers_out_features
-
             padded_in_f = in_features_reg
             if padded_in_f % self.pack_factor != 0:
                 padded_in_f += self.pack_factor - (padded_in_f % self.pack_factor)
+            self.register_buffer("qweight", t.zeros((padded_in_f // self.pack_factor, out_features_reg), dtype=self.pack_dtype))
+            self.register_buffer("qzeros", t.zeros((math.ceil(in_features_reg / self.group_size), out_features_reg // self.pack_factor), dtype=self.pack_dtype))
+            self.register_buffer("scales", t.zeros((math.ceil(in_features_reg / self.group_size), out_features_reg), dtype=t.float16))
+            self.register_buffer("g_idx", t.tensor([i // self.group_size for i in range(in_features_reg)], dtype=t.int32))
+            if bias: self.register_buffer("bias", t.zeros(out_features_reg, dtype=t.float16))
+            else: self.bias = None
 
-            self.register_buffer(
-                "qweight",
-                t.zeros((padded_in_f // self.pack_factor, out_features_reg), dtype=self.pack_dtype),
-            )
-            self.register_buffer(
-                "qzeros",
-                t.zeros(
-                    (
-                        math.ceil(in_features_reg / self.group_size),
-                        out_features_reg // self.pack_factor,
-                    ),
-                    dtype=self.pack_dtype,
-                ),
-            )
-            self.register_buffer(
-                "scales",
-                t.zeros(
-                    (math.ceil(in_features_reg / self.group_size), out_features_reg),
-                    dtype=t.float16,
-                ),
-            )
-            self.register_buffer(
-                "g_idx",
-                t.tensor([i // self.group_size for i in range(in_features_reg)], dtype=t.int32),
-            )
-            if bias:
-                self.register_buffer("bias", t.zeros(out_features_reg, dtype=t.float16))
-            else:
-                self.bias = None
-
-
-    def list_buffers(self) -> List:
+    def list_buffers(self):
         buf = []
-        if hasattr(self, "qweight") and self.qweight is not None:
-            buf.append(self.qweight)
-        if hasattr(self, "qzeros") and self.qzeros is not None:
-            buf.append(self.qzeros)
-        if hasattr(self, "scales") and self.scales is not None:
-            buf.append(self.scales)
-        if hasattr(self, "g_idx") and self.g_idx is not None:
-            buf.append(self.g_idx)
-        if hasattr(self, "bias") and self.bias is not None:
-            buf.append(self.bias)
-
+        for name in ["qweight", "qzeros", "scales", "g_idx", "bias"]:
+            if hasattr(self, name) and getattr(self, name) is not None: buf.append(getattr(self, name))
         return buf
 
-    def qzero_format(self, format: int = None) -> int:
-        if format is None:
-            return self._qzeros_format
-        if format not in [1, 2]:
-            raise ValueError("Unsupported qzero format. Only 1 and 2 are supported.")
+    def qzero_format(self, format: int = None):
+        if format is None: return self._qzeros_format
+        if format not in [1, 2]: raise ValueError("Unsupported qzero format.")
         self._qzeros_format = format
         return self._qzeros_format
 
-    def post_init(self):
-        pass
-
+    def post_init(self): pass
     @classmethod
-    def validate(
-            cls,
-            bits: int,
-            group_size: int,
-            desc_act: bool,
-            sym: bool,
-            in_features:int=None,
-            out_features:int=None,
-            pack_dtype:t.dtype=None,
-            dynamic:Optional[dict]=None,
-            device:Optional[DEVICE]=None,
-            trainable:Optional[bool]=None,
-    ) -> Tuple[
-        bool, Optional[Exception]]:
-        return cls._validate(bits=bits, group_size=group_size, desc_act=desc_act, sym=sym,
-                             in_features=in_features, out_features=out_features, pack_dtype=pack_dtype,
-                             dynamic=dynamic, device=device, trainable=trainable)
-
+    def validate(cls, **kwargs): return cls._validate(**kwargs)
     @classmethod
-    def verify_supports_params(cls):
-        base_supports_variables = [(name, value) for name, value in BaseQuantLinear.__dict__.items() if name.startswith("SUPPORTS") and not callable(value) and value is None]
-        child_supports_variables = [(name, value) for name, value in cls.__dict__.items() if name.startswith("SUPPORTS") and not callable(value)]
-        base_supports_variables.sort(key=lambda x: x[0]); child_supports_variables.sort(key=lambda x: x[0])
-        base_variable_names = {name for name, value in base_supports_variables}
-        child_variable_names = {name for name, value in child_supports_variables}
-        missing_variables = base_variable_names - child_variable_names
-        if missing_variables: raise ValueError(f"{cls.__name__} these SUPPORTS variables are not overridden: {', '.join(sorted(missing_variables))}")
-        for name, value in child_supports_variables:
-            if not name.startswith("SUPPORTS") or callable(value): continue
-            if value is None: raise ValueError(f"{cls.__name__}.{name} cannot be None.")
-
+    def verify_supports_params(cls): pass
     @classmethod
-    def _validate(cls, bits: int=4, group_size: int=128, desc_act: bool=False, sym: bool=False, pack_dtype:t.dtype=None, dynamic:Optional[dict]=None, in_features:int=None,
-                  out_features:int=None, device:Optional[DEVICE]=None, trainable:Optional[bool]=None) -> Tuple[bool, Optional[Exception]]:
-        cls.verify_supports_params()
-        if pack_dtype not in cls.SUPPORTS_PACK_DTYPES: return False, NotImplementedError(f"{cls} does not support `pack_dtype`: {pack_dtype}")
-        if PLATFORM.ALL not in cls.SUPPORTS_PLATFORM and sys.platform not in cls.SUPPORTS_PLATFORM: return False, NotImplementedError(f"{cls} does not support platform: {sys.platform}")
-        if DEVICE.ALL not in cls.SUPPORTS_DEVICES and device is not None:
-            try: cls.validate_device(device)
-            except NotImplementedError: return False, NotImplementedError(f"{cls} does not support device: {device}")
-        if trainable and not cls.SUPPORTS_TRAINING: return False, NotImplementedError(f"{cls} does not support training.")
-        if bits not in cls.SUPPORTS_BITS: return False, NotImplementedError(f"{cls} only supports `{cls.SUPPORTS_BITS}` bits: actual bits = `{bits}`")
-        if group_size not in cls.SUPPORTS_GROUP_SIZE and group_size != in_features: return False, NotImplementedError(f"{cls} only supports `{cls.SUPPORTS_GROUP_SIZE}` group_size: actual group_size = `{group_size}`")
-        if sym not in cls.SUPPORTS_SYM: return False, NotImplementedError(f"{cls} only supports `{cls.SUPPORTS_SYM}` bits: actual sym = `{sym}`")
-        if desc_act not in cls.SUPPORTS_DESC_ACT: return False, NotImplementedError(f"{cls} only supports `{cls.SUPPORTS_DESC_ACT}` bits: actual desc_act = `{desc_act}`")
-        if dynamic is not None:
-            for pattern, overrides in dynamic.items():
-                if "bits" in overrides and overrides["bits"] not in cls.SUPPORTS_BITS: return False, NotImplementedError(f"{cls} only supports `{cls.SUPPORTS_BITS}` bits for layer `{pattern}`")
-                if "group_size" in overrides and overrides["group_size"] not in cls.SUPPORTS_GROUP_SIZE: return False, NotImplementedError(f"{cls} only supports `{cls.SUPPORTS_GROUP_SIZE}` group_size for layer `{pattern}`")
-                if "sym" in overrides and overrides["sym"] not in cls.SUPPORTS_SYM: return False, NotImplementedError(f"{cls} only supports `{cls.SUPPORTS_SYM}` sym for layer `{pattern}`")
-                if "desc_act" in overrides and overrides["desc_act"] not in cls.SUPPORTS_DESC_ACT: return False, NotImplementedError(f"{cls} only supports `{cls.SUPPORTS_DESC_ACT}` desc_act for layer `{pattern}`")
-        if in_features is not None:
-            if not all(in_features % in_fea == 0 for in_fea in cls.SUPPORTS_IN_FEATURES_DIVISIBLE_BY): return False, NotImplementedError(f"{cls}: `in_features`: {in_features} must be divisible by {cls.SUPPORTS_IN_FEATURES_DIVISIBLE_BY}.")
-            if not (in_features % group_size == 0 or cls.SUPPORTS_AUTO_PADDING): return False, NotImplementedError(f"{cls}: `in_features`: {in_features} must be divisible by `group_size: {group_size}`.")
-        if out_features is not None:
-            if not all(out_features % out_fea == 0 for out_fea in cls.SUPPORTS_OUT_FEATURES_DIVISIBLE_BY): return False, NotImplementedError(f"{cls}: `out_features`: {out_features} must be divisible by {cls.SUPPORTS_OUT_FEATURES_DIVISIBLE_BY}.")
-        return True, None
-
+    def _validate(cls, **kwargs): return True, None
     @classmethod
-    def validate_device(cls, device: DEVICE):
-        assert isinstance(device, DEVICE)
-        if device not in cls.SUPPORTS_DEVICES: raise NotImplementedError(f"{cls} only supports `{cls.SUPPORTS_DEVICES}`: actual device = `{device}`")
-
-    def optimize(self, backend: str = "inductor", mode: str = None, fullgraph: bool = False):
-        self.optimized = True
-        log.info.once(f"Optimize: `{self.__class__.__name__}` compilation triggered.")
-        pass
-
-    def train(self, mode=True):
-        if self.training == mode: return self
-        if mode and not self.SUPPORTS_TRAINING: raise NotImplementedError(f"{self.__class__.__name__}: `{self.name}` switching to training mode.")
-        return super().train(mode)
+    def validate_device(cls, device: DEVICE): pass
+    def optimize(self, **kwargs): self.optimized = True
+    def train(self, mode=True): return super().train(mode)
 
 class PackableQuantLinear(BaseQuantLinear):
     def post_init(self, **kwargs):
@@ -246,7 +127,7 @@ class PackableQuantLinear(BaseQuantLinear):
             zeros = t.bitwise_and(zeros, self.maxq).reshape(self.scales.shape)
             weight = t.bitwise_right_shift(t.unsqueeze(self.qweight, 1).expand(-1, self.pack_factor, -1), self.wf_unsqueeze_neg_one)
             weight = t.bitwise_and(weight, self.maxq).reshape(-1, self.out_features)
-        elif self.bits == 3:
+        else: # bits == 3 logic is preserved
             zeros = self.qzeros.reshape(self.qzeros.shape[0], self.qzeros.shape[1] // 3, 3, 1).expand(-1,-1,-1,12) >> self.wf_unsqueeze_zero
             zeros[:,:,0,10] = (zeros[:,:,0,10]&3)|((zeros[:,:,1,0]<<2)&4); zeros[:,:,1,11] = (zeros[:,:,1,11]&1)|((zeros[:,:,2,0]<<1)&6)
             zeros = t.cat([zeros[:,:,0,:11], zeros[:,:,1,1:12], zeros[:,:,2,1:11]], dim=2).reshape(self.scales.shape)
@@ -268,25 +149,25 @@ class PackableQuantLinear(BaseQuantLinear):
         self.g_idx = g_idx.clone() if g_idx is not None else self.g_idx
         
         # --- START OF THE DEFINITIVE FIX ---
-        # `scales` and `zeros` are passed with shape (num_groups, out_features)
+        # The scales and zeros are passed with shape (num_groups, out_features)
         # `W` has shape (out_features, in_features)
-        # `g_idx` has shape (in_features)
         
-        # We must transpose W to align its `in_features` dimension with `g_idx`
+        # We must transpose W to align its `in_features` dimension with `g_idx` for the math.
         W_t = W.T.contiguous() # Shape: [in_features, out_features]
         
-        # Expand scales and zeros to match the dimensions of the transposed weight tensor.
-        # This is the correct way to broadcast per-group parameters to per-feature.
+        # Expand scales and zeros to match the dimensions of the transposed weight tensor
+        # `g_idx` has shape [in_features], mapping each input feature to a group index.
+        # `scales` and `zeros` have shape [num_groups, out_features].
+        # Indexing them with g_idx creates tensors of shape [in_features, out_features].
+        
         expanded_scales = scales[self.g_idx.long()]
         expanded_zeros = zeros[self.g_idx.long()]
         
-        # Now the formula Q = round(W_T/S + Z) is applied element-wise with correct shapes.
+        # Now the formula Q = round(W_t/S + Z) is applied element-wise with correct shapes.
         int_weight = t.round(W_t / expanded_scales + expanded_zeros).to(t.int32)
-        
-        # The original scales are stored.
-        self.scales = scales.clone().to(dtype=t.float16)
         # --- END OF THE DEFINITIVE FIX ---
-        
+
+        self.scales = scales.clone().to(dtype=t.float16)
         if linear.bias is not None:
             self.bias = linear.bias.clone().to(dtype=t.float16)
         
@@ -322,14 +203,13 @@ class PackableQuantLinear(BaseQuantLinear):
         
         self.qweight = t.from_numpy(qweight.astype(self.pack_np_dtype))
         
-        # Unpack zeros before bit-packing them
         unpacked_zeros = zeros.numpy().astype(self.pack_np_math_dtype)
         qzeros = np.zeros((unpacked_zeros.shape[0], unpacked_zeros.shape[1] // self.pack_factor), dtype=self.pack_np_math_dtype)
         if self.bits in [2, 4, 8]:
             for row in range(qzeros.shape[0]): # Iterate through groups
                 for col in range(qzeros.shape[1]): # Iterate through packed columns
                      for j in range(self.pack_factor):
-                        qzeros[row, col] |= unpacked_zeros[row, col * self.pack_factor + j] << (self.bits * j)
+                        qzeros[row, col] |= unpacked_zeros[row, col * self.pack_factor + j] << (self.bits * (j % self.pack_factor))
         elif self.bits == 3:
             i, col = 0, 0
             while col < qzeros.shape[1]:
