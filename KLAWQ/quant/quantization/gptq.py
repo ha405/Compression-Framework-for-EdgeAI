@@ -81,15 +81,6 @@ class GPTQ:
         self._validate_module(self.module)
 
         self.qcfg = qcfg if qcfg else QuantizeConfig()
-        if self.qcfg.group_size != -1 and self.columns < self.qcfg.group_size:
-            log.warning(
-                f"For layer {self.name}, group_size ({self.qcfg.group_size}) is larger than "
-                f"the number of input features ({self.columns}). "
-                f"Setting group_size = -1 (per-channel quantization) for this layer to prevent errors."
-            )
-            # Create a shallow copy to modify only for this layer instance
-            self.qcfg = copy.copy(self.qcfg)
-            self.qcfg.group_size = -1
         if not hasattr(self.qcfg, 'beta'): self.qcfg.beta = 0.0
         if not hasattr(self.qcfg, 'tau'): self.qcfg.tau = 1.0
         if not hasattr(self.qcfg, 'damp_percent'): self.qcfg.damp_percent = 0.01

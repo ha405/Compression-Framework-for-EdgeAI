@@ -1,8 +1,10 @@
+# auto_gptq/modeling/resnet.py
+
 from typing import List, Dict, Union, Tuple
 
 import torch
 import torch.nn as nn
-from PIL import Image
+from PIL.Image import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision.models import resnet50
 try:
@@ -10,47 +12,56 @@ try:
 except ImportError:
     from torchvision import transforms
 
+
 from ..base import BaseGPTQModel
-from ...utils.model import MODALITY, find_modules, get_module
+from ...utils.data import collate_data
+from ...utils.model import MODALITY
+
 
 class ResNet50GPTQ(BaseGPTQModel):
+    """
+    GPTQ configuration for the torchvision.models.resnet50 model.
+    """
     is_hf_model = False
     loader = resnet50
-    
-    # DEFINITIVE FIX: Define the base modules to be quantized separately.
-    # The framework has dedicated logic for these.
-    base_modules = ["conv1", "fc"]
-    
-    # DEFINITIVE FIX: Define the four separate layer blocks. The framework
-    # will iterate through these lists of blocks.
-    layers_node = ["layer1", "layer2", "layer3", "layer4"]
+    base_modules = [
+        "conv1",
+        "fc",
+    ]
+    pre_lm_head_norm_module = None
+    layers_node = None
     layer_type = "Bottleneck"
-    
-    # Define quantizable modules within a Bottleneck block.
     layer_modules = [
         ["conv1"],
         ["conv2"],
         ["conv3"],
         ["downsample.0"],
     ]
-    
-    # This remains crucial for handling blocks that don't have a downsample layer.
     layer_modules_strict = False
-    
     modality = [MODALITY.IMAGE]
-    
-    # DEFINITIVE FIX: We NO LONGER need a custom get_layers method.
-    # The configuration above is now sufficient for the original framework logic.
-    
+    require_load_processor = False
+
+    def get_layers(self, model: nn.Module) -> List[Tuple[str, nn.Module]]:
+        """
+        Overrides the default layer-finding mechanism to correctly handle the
+        ResNet architecture by collecting blocks AND THEIR NAMES from the model.
+        """
+        named_blocks = []
+        for stage_name in ["layer1", "layer2", "layer3", "layer4"]:
+            stage = getattr(model, stage_name)
+            for i, block in enumerate(stage):
+                named_blocks.append((f"{stage_name}.{i}", block))
+        
+        return named_blocks
+
     def prepare_dataset(
         self,
-        calibration_dataset: Union[List[Image.Image], Dataset],
+        calibration_dataset: Union[List[Image], Dataset],
         batch_size: int = 1,
         **kwargs
     ) -> List[Dict[str, torch.Tensor]]:
         """
-        This method must return a list of dictionaries, as the original looper
-        unpacks it with **. The key 'x' is arbitrary but conventional.
+        Overrides the base method to prepare an image dataset for calibration.
         """
         image_transforms = transforms.Compose([
             transforms.Resize(256),
@@ -63,19 +74,25 @@ class ResNet50GPTQ(BaseGPTQModel):
             def __init__(self, images, transform):
                 self.images = images
                 self.transform = transform
-            def __len__(self): return len(self.images)
+
+            def __len__(self):
+                return len(self.images)
+
             def __getitem__(self, idx):
                 img = self.images[idx]
-                if not isinstance(img, Image.Image):
-                    img = transforms.ToPILImage()(img)
                 return self.transform(img)
 
-        dataset = ImageDataset(calibration_dataset, image_transforms)
+        if isinstance(calibration_dataset, list):
+            dataset = ImageDataset(calibration_dataset, image_transforms)
+        elif isinstance(calibration_dataset, Dataset):
+            dataset = ImageDataset(calibration_dataset, image_transforms)
+        else:
+            raise ValueError("calibration_dataset must be a list of PIL Images or a PyTorch Dataset.")
+            
         data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
         
         batched_data = []
         for batch in data_loader:
-            # The model's forward method expects `model(x=...)` when using **.
             batched_data.append({'x': batch})
             
         return batched_data
