@@ -414,9 +414,11 @@ class PackableQuantLinear(BaseQuantLinear):
         # 3) Normalize scales/zeros to [out, num_groups]
         num_groups = math.ceil(self.in_features / self.group_size)
         if scales.shape == (num_groups, out_features):
+            # coming in [groups, out] → transpose to [out, groups]
             scales_og = scales.T.contiguous()
             zeros_og  = zeros.T.contiguous()
         else:
+            # coming in [out, groups]
             scales_og = scales.contiguous()
             zeros_og  = zeros.contiguous()
 
@@ -424,21 +426,22 @@ class PackableQuantLinear(BaseQuantLinear):
         exp_s = scales_og[:, g_idx_full]
         exp_z = zeros_og[:,  g_idx_full]
 
-        # 5) Quantize
+        # 5) Quantize to int32
         intW = t.round((W / exp_s) + exp_z).to(t.int32)
 
-        # 6) Store float16 metadata (use t.float16)
-        self.scales = scales.clone().to(t.float16)
+        # 6) Store float16 metadata—**fixed shape** [groups, out]
+        # scales_og is [out, groups], so transpose back
+        self.scales = scales_og.T.clone().to(t.float16)
         if linear.bias is not None:
             self.bias = linear.bias.clone().to(t.float16)
 
-        # 7) Pad to multiple of pack_factor
+        # 7) Pad in_total to multiple of pack_factor
         pad = (-in_total) % self.pack_factor
         if pad:
             intW = t.cat([intW, intW.new_zeros(out_features, pad)], dim=1)
             in_total += pad
 
-        # 8) Move to NumPy [in_padded, out]
+        # 8) Move weight to NumPy [in_padded, out]
         int_np = intW.T.cpu().numpy().astype(self.pack_np_math_dtype)
         num_rows = in_total // self.pack_factor
 
@@ -448,18 +451,16 @@ class PackableQuantLinear(BaseQuantLinear):
             for r in range(num_rows):
                 for j in range(self.pack_factor):
                     qw[r] |= int_np[r*self.pack_factor + j] << (self.bits * j)
-        else:  # 3‑bit
+        else:  # 3‑bit special
             i = row = 0
             while row < num_rows:
                 for j in range(i, i+10):
                     qw[row] |= int_np[j] << (3*(j-i))
-                i += 10
-                qw[row] |= int_np[i] << 30; row += 1
+                i += 10; qw[row] |= int_np[i] << 30; row += 1
                 qw[row] |= (int_np[i] >> 2) & 1; i += 1
                 for j in range(i, i+10):
                     qw[row] |= int_np[j] << (3*(j-i)+1)
-                i += 10
-                qw[row] |= int_np[i] << 31; row += 1
+                i += 10; qw[row] |= int_np[i] << 31; row += 1
                 qw[row] |= (int_np[i] >> 1) & 0x3; i += 1
                 for j in range(i, i+10):
                     qw[row] |= int_np[j] << (3*(j-i)+2)
@@ -467,7 +468,7 @@ class PackableQuantLinear(BaseQuantLinear):
 
         self.qweight = t.from_numpy(qw.astype(self.pack_np_dtype))
 
-        # 10) Bit‑pack zeros into [num_groups, out//pack_factor]
+        # 10) Bit‑pack zeros into [groups, out//pack_factor]
         if zeros.shape == (num_groups, out_features):
             zeros_np = zeros.cpu().numpy()
         else:
