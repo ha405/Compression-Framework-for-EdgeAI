@@ -85,7 +85,7 @@ class TorchQuantLinear(PackableQuantLinear):
         # --- START OF THE DEFINITIVE FORWARD PASS FIX ---
         if self.is_conv:
             # If this layer represents a convolution, use F.conv2d
-            weight = self.dequantize_weight().reshape(self.original_shape.tolist())
+            weight = self.dequantize_weight().reshape(self.original_shape.tolist()).to(x.dtype)
             return F.conv2d(x, weight, self.bias, **self.conv_kwargs)
         else:
             # This is the original, correct logic for Linear layers
