@@ -389,18 +389,23 @@ class PackableQuantLinear(BaseQuantLinear):
             weight = t.cat([weight[:, 0, :11], weight[:, 1, 1:12], weight[:, 2, 1:11]], dim=1)
         weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
 
-        if num_itr == 1:
+        # --- START OF THE DEFINITIVE FIX ---
+        if self.desc_act:
+            # If act-order is used, g_idx will be used to unscramble.
+            # The scales and zeros are per-group, so we index them with the group index.
             weights = self.scales[self.g_idx.long()] * (weight - zeros[self.g_idx.long()])
         else:
-            num_dim = self.g_idx.shape[0] // num_itr
-            weights = []
-            for i in range(num_itr):
-                scale_i = self.scales[:, i * num_dim: (i + 1) * num_dim]
-                weight_i = weight[:, i * num_dim: (i + 1) * num_dim]
-                zeros_i = zeros[:, i * num_dim: (i + 1) * num_dim]
-                g_idx_i = self.g_idx[i * num_dim: (i + 1) * num_dim].long()
-                weights.append(scale_i[g_idx_i] * (weight_i - zeros_i[g_idx_i]))
-            weights = t.cat(weights, dim=1)
+            # If not using act-order, g_idx is just a simple range.
+            # We can reshape scales and zeros to broadcast correctly without indexing.
+            # Reshape scales and zeros to (num_groups, 1, out_features) to broadcast against
+            # a weight tensor that we can view as (num_groups, group_size, out_features).
+            num_groups = self.in_features // self.group_size
+            reshaped_scales = self.scales.reshape(num_groups, 1, self.out_features)
+            reshaped_zeros = zeros.reshape(num_groups, 1, self.out_features)
+            reshaped_weight = weight.reshape(num_groups, self.group_size, self.out_features)
+            
+            weights = (reshaped_scales * (reshaped_weight - reshaped_zeros)).reshape(self.in_features, self.out_features)
+        # --- END OF THE DEFINITIVE FIX ---
 
         return weights
 
