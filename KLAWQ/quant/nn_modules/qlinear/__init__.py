@@ -390,39 +390,43 @@ class PackableQuantLinear(BaseQuantLinear):
         weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
 
         # --- START OF THE DEFINITIVE FIX ---
-        # The original `if/else num_itr` block is removed. This new logic is robust.
         if self.desc_act:
             # If act-order is used, g_idx will be used to unscramble.
-            # The scales and zeros are per-group, so we index them with the group index.
             weights = self.scales[self.g_idx.long()] * (weight - zeros[self.g_idx.long()])
         else:
-            # If not using act-order, g_idx is just a simple range.
-            # We can reshape scales and zeros to broadcast correctly without indexing.
-            # This handles cases where in_features is not a multiple of group_size.
-            num_groups = self.scales.shape[0]
+            # If not using act-order, g_idx is a simple range. We can avoid indexing
+            # and use reshaping for broadcasting, which is more robust.
             
-            # Reshape scales and zeros to (num_groups, 1, out_features)
-            reshaped_scales = self.scales.reshape(num_groups, 1, self.out_features)
-            reshaped_zeros = zeros.reshape(num_groups, 1, self.out_features)
+            # The scales and zeros are per-group.
+            # scales shape: (num_groups, out_features)
+            # zeros shape:  (num_groups, out_features)
+            # weight shape: (in_features, out_features)
             
-            # View the weight as (num_groups, group_size, out_features)
-            # We need to handle the last group which might be smaller.
+            # We expand scales and zeros to match the weight tensor's in_features dimension.
+            # The `repeat_interleave` function will repeat each row (each group's parameters) `group_size` times.
             
-            # Pad the weight tensor if in_features is not divisible by group_size
+            # Handle the last group which might not be full
+            num_groups = math.ceil(self.in_features / self.group_size)
+            
+            # This should give us the number of full groups and the size of the last group
+            full_groups = self.in_features // self.group_size
+            last_group_size = self.in_features % self.group_size
+            
+            if last_group_size == 0:
+                last_group_size = self.group_size # No remainder, all groups are full
+                
+            # Create a tensor of repeat counts for each group
+            repeat_counts = [self.group_size] * full_groups
             if self.in_features % self.group_size != 0:
-                pad_len = self.group_size - (self.in_features % self.group_size)
-                # Pad with a value that won't affect the main data, e.g., 0.
-                # The dequantized value will be `scale * (0 - zero)`, which isn't ideal but won't corrupt main weights.
-                # A better approach would be to use a padding value that results in zero after dequantization, but that's complex.
-                # Padding with zero is a common simplification.
-                padded_weight = t.cat([weight, weight.new_zeros(pad_len, weight.shape[1])], dim=0)
-                reshaped_weight = padded_weight.reshape(num_groups, self.group_size, self.out_features)
-            else:
-                reshaped_weight = weight.reshape(num_groups, self.group_size, self.out_features)
-            
-            # Perform dequantization with broadcasting and then reshape back, slicing off padding.
-            dequantized_weight = (reshaped_scales * (reshaped_weight - reshaped_zeros)).reshape(-1, self.out_features)
-            weights = dequantized_weight[:self.in_features, :]
+                 # This logic was slightly off, the last group has a different size
+                 full_groups = self.in_features // self.group_size
+                 last_group_size = self.in_features - (full_groups * self.group_size)
+                 repeat_counts = [self.group_size] * full_groups + [last_group_size]
+
+            expanded_scales = self.scales.repeat_interleave(t.tensor(repeat_counts, device=self.scales.device), dim=0)
+            expanded_zeros = zeros.repeat_interleave(t.tensor(repeat_counts, device=zeros.device), dim=0)
+
+            weights = expanded_scales * (weight - expanded_zeros)
         # --- END OF THE DEFINITIVE FIX ---
 
         return weights
