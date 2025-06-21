@@ -450,7 +450,7 @@ def ModelLoader(cls):
                 model = model.to(dtype=torch_dtype)
 
                 modules = find_modules(model, [torch.nn.Linear, torch.nn.Conv2d])
-                make_quant(model, modules, qcfg, device=device)
+                make_quant(model, modules, qcfg, backend, cls.lm_head, device=device)
             
             tokenizer = None
 
