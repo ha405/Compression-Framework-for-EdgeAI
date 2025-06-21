@@ -87,6 +87,7 @@ class GPTQ:
                 f"the number of input features ({self.columns}). "
                 f"Setting group_size = -1 (per-channel quantization) for this layer to prevent errors."
             )
+            # Create a shallow copy to modify only for this layer instance
             self.qcfg = copy.copy(self.qcfg)
             self.qcfg.group_size = -1
         if not hasattr(self.qcfg, 'beta'): self.qcfg.beta = 0.0

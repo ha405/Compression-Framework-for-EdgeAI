@@ -11,38 +11,37 @@ except ImportError:
     from torchvision import transforms
 
 from ..base import BaseGPTQModel
-from ...utils.model import MODALITY, get_module
+from ...utils.model import MODALITY, find_modules, get_module
 
 class ResNet50GPTQ(BaseGPTQModel):
     is_hf_model = False
     loader = resnet50
     
-    # We will now correctly handle the base modules.
+    # DEFINITIVE FIX: Define the base modules to be quantized separately.
+    # The framework has dedicated logic for these.
     base_modules = ["conv1", "fc"]
     
-    # We define the repeating block structure.
+    # DEFINITIVE FIX: Define the four separate layer blocks. The framework
+    # will iterate through these lists of blocks.
     layers_node = ["layer1", "layer2", "layer3", "layer4"]
     layer_type = "Bottleneck"
+    
+    # Define quantizable modules within a Bottleneck block.
     layer_modules = [
         ["conv1"],
         ["conv2"],
         ["conv3"],
         ["downsample.0"],
     ]
+    
+    # This remains crucial for handling blocks that don't have a downsample layer.
     layer_modules_strict = False
+    
     modality = [MODALITY.IMAGE]
     
-    # We override the get_layers to handle the four separate layer attributes.
-    def get_layers(self, model: nn.Module) -> nn.ModuleList:
-        """
-        This method now correctly combines the four layer stages into a single
-        list for the looper to iterate over.
-        """
-        all_blocks = nn.ModuleList()
-        for stage_name in self.layers_node:
-            all_blocks.extend(getattr(model, stage_name))
-        return all_blocks
-
+    # DEFINITIVE FIX: We NO LONGER need a custom get_layers method.
+    # The configuration above is now sufficient for the original framework logic.
+    
     def prepare_dataset(
         self,
         calibration_dataset: Union[List[Image.Image], Dataset],
@@ -50,9 +49,8 @@ class ResNet50GPTQ(BaseGPTQModel):
         **kwargs
     ) -> List[Dict[str, torch.Tensor]]:
         """
-        This method now returns data in the dictionary format that the
-        original, unmodified looper expects. The key 'x' will be passed
-        to the model's forward method.
+        This method must return a list of dictionaries, as the original looper
+        unpacks it with **. The key 'x' is arbitrary but conventional.
         """
         image_transforms = transforms.Compose([
             transforms.Resize(256),
@@ -77,8 +75,7 @@ class ResNet50GPTQ(BaseGPTQModel):
         
         batched_data = []
         for batch in data_loader:
-            # The model's forward method expects a single tensor, not kwargs.
-            # We must use a standard key that the looper will unpack as a positional argument.
+            # The model's forward method expects `model(x=...)` when using **.
             batched_data.append({'x': batch})
             
         return batched_data
