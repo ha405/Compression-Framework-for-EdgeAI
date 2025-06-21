@@ -17,6 +17,7 @@ else:
     from huggingface_hub import snapshot_download
 
 from packaging.version import InvalidVersion, Version
+import torch.nn as nn
 from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
 from transformers.modeling_utils import no_init_weights
 from transformers.utils import is_flash_attn_2_available
@@ -444,13 +445,25 @@ def ModelLoader(cls):
             model_save_name = resolved_archive_file
 
             with no_init_weights():
+                temp_model = cls.loader(weights=None)
+                
                 model = cls.loader(weights=None)
                 if torch_dtype is None or torch_dtype == "auto" or not isinstance(torch_dtype, torch.dtype):
                     torch_dtype = torch.float32
                 model = model.to(dtype=torch_dtype)
-
-                modules = find_modules(model, [torch.nn.Linear, torch.nn.Conv2d])
-                make_quant(model, modules, qcfg, backend, cls.lm_head, device=device)
+                
+                modules_to_quantize = find_modules(model, [torch.nn.Linear, torch.nn.Conv2d])
+                make_quant(model, modules_to_quantize, qcfg, backend, cls.lm_head, device=device)
+                
+                # After creating TorchQuantLinear layers, tell them if they are convolutions
+                quantized_layers = find_modules(model, [TorchQuantLinear])
+                for name, q_layer in quantized_layers.items():
+                    original_layer = get_module(temp_model, name)
+                    if isinstance(original_layer, nn.Conv2d):
+                        if hasattr(q_layer, 'set_conv_parameters'):
+                             q_layer.set_conv_parameters(original_layer)
+                del temp_model
+                
             
             tokenizer = None
 
