@@ -417,13 +417,21 @@ class PackableQuantLinear(BaseQuantLinear):
         g_idx_full = base_gidx.repeat_interleave(kernel_elems) if kernel_elems > 1 else base_gidx
         print(f"[DEBUG] g_idx_full shape   = {g_idx_full.shape} (kernel_elems={kernel_elems})")
 
-        # 3) Prepare scales/zeros
-        scales_og = scales.T.contiguous()  # expecting [out, groups]
-        zeros_og  = zeros.T.contiguous()   # expecting [out, groups]
+                # 3) Prepare scales/zeros
+        # scales may be passed as [groups, out] or [out, groups]
+        num_groups = math.ceil(self.in_features / self.group_size)
+        if scales.shape[0] == num_groups and scales.shape[1] == out_features:
+            # [groups, out] -> transpose to [out, groups]
+            scales_og = scales.T.contiguous()
+            zeros_og  = zeros.T.contiguous()
+        else:
+            # assume [out, groups]
+            scales_og = scales.contiguous()
+            zeros_og  = zeros.contiguous()
         print(f"[DEBUG] scales_og shape    = {scales_og.shape}")
         print(f"[DEBUG] zeros_og shape     = {zeros_og.shape}")
 
-        # 4) Expand to [out, in_total]
+        # 4) Expand to [out, in_total] to [out, in_total]
         exp_s = scales_og[:, g_idx_full]
         exp_z = zeros_og[:,  g_idx_full]
         print(f"[DEBUG] W.shape            = {W.shape}")
@@ -489,3 +497,4 @@ class PackableQuantLinear(BaseQuantLinear):
                 for j in range(i,i+10): qz[:,col]|=zeros_np[:,j]<<(3*(j-i)+2)
                 i+=10; col+=1
         self.qzeros = t.from_numpy(qz.astype(self.pack_np_dtype))
+
