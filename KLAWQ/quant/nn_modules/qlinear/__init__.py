@@ -397,36 +397,41 @@ class PackableQuantLinear(BaseQuantLinear):
             # If not using act-order, g_idx is a simple range. We can avoid indexing
             # and use reshaping for broadcasting, which is more robust.
             
-            # The scales and zeros are per-group.
-            # scales shape: (num_groups, out_features)
-            # zeros shape:  (num_groups, out_features)
+            # scales/zeros shape: (num_groups, out_features)
             # weight shape: (in_features, out_features)
             
-            # We expand scales and zeros to match the weight tensor's in_features dimension.
-            # The `repeat_interleave` function will repeat each row (each group's parameters) `group_size` times.
+            # Expand scales and zeros to match the weight tensor's in_features dimension.
+            # `repeat_interleave` will repeat each row (each group's parameters) `group_size` times.
             
-            # Handle the last group which might not be full
             num_groups = math.ceil(self.in_features / self.group_size)
             
-            # This should give us the number of full groups and the size of the last group
+            # This handles the last group which might not be full
             full_groups = self.in_features // self.group_size
             last_group_size = self.in_features % self.group_size
             
             if last_group_size == 0:
-                last_group_size = self.group_size # No remainder, all groups are full
-                
-            # Create a tensor of repeat counts for each group
-            repeat_counts = [self.group_size] * full_groups
-            if self.in_features % self.group_size != 0:
-                 # This logic was slightly off, the last group has a different size
-                 full_groups = self.in_features // self.group_size
-                 last_group_size = self.in_features - (full_groups * self.group_size)
-                 repeat_counts = [self.group_size] * full_groups + [last_group_size]
+                # No remainder, all groups are full
+                repeat_counts = t.tensor([self.group_size] * num_groups, device=self.scales.device, dtype=t.long)
+            else:
+                repeat_counts = t.tensor([self.group_size] * full_groups + [last_group_size], device=self.scales.device, dtype=t.long)
+            
+            # This check is needed because repeat_interleave requires the sum of repeats to match the dimension size
+            if self.scales.shape[0] != len(repeat_counts):
+                # This can happen if the number of groups in scales was padded. We only care about the groups we have.
+                num_groups = self.scales.shape[0]
+                # Re-calculate repeat counts for the actual number of groups
+                full_groups = self.in_features // self.group_size
+                last_group_size = self.in_features % self.group_size
+                if num_groups == full_groups + 1 and last_group_size > 0:
+                     repeat_counts = t.tensor([self.group_size] * full_groups + [last_group_size], device=self.scales.device, dtype=t.long)
+                else: # all full groups
+                     repeat_counts = t.tensor([self.group_size] * num_groups, device=self.scales.device, dtype=t.long)
+            
+            expanded_scales = self.scales.repeat_interleave(repeat_counts, dim=0)
+            expanded_zeros = zeros.repeat_interleave(repeat_counts, dim=0)
 
-            expanded_scales = self.scales.repeat_interleave(t.tensor(repeat_counts, device=self.scales.device), dim=0)
-            expanded_zeros = zeros.repeat_interleave(t.tensor(repeat_counts, device=zeros.device), dim=0)
-
-            weights = expanded_scales * (weight - expanded_zeros)
+            # Slicing ensures we match the exact in_features dimension
+            weights = expanded_scales[:self.in_features] * (weight - expanded_zeros[:self.in_features])
         # --- END OF THE DEFINITIVE FIX ---
 
         return weights
