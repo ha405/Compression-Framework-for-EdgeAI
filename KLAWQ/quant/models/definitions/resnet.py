@@ -1,5 +1,3 @@
-# auto_gptq/modeling/resnet.py
-
 from typing import List, Dict, Union, Tuple
 
 import torch
@@ -12,57 +10,55 @@ try:
 except ImportError:
     from torchvision import transforms
 
-
 from ..base import BaseGPTQModel
-from ...utils.data import collate_data
-from ...utils.model import MODALITY
+from ...utils.model import MODALITY, find_modules, get_module
 
 
 class ResNet50GPTQ(BaseGPTQModel):
-    """
-    GPTQ configuration for the torchvision.models.resnet50 model.
-    """
     is_hf_model = False
+    
     loader = resnet50
-    base_modules = [
-        "conv1",
-        "fc",
-    ]
+    
+    base_modules = []
+
     pre_lm_head_norm_module = None
+
     layers_node = None
+    
     layer_type = "Bottleneck"
+    
     layer_modules = [
         ["conv1"],
         ["conv2"],
         ["conv3"],
         ["downsample.0"],
     ]
+    
     layer_modules_strict = False
+    
     modality = [MODALITY.IMAGE]
+    
     require_load_processor = False
 
     def get_layers(self, model: nn.Module) -> List[Tuple[str, nn.Module]]:
-        """
-        Overrides the default layer-finding mechanism to correctly handle the
-        ResNet architecture by collecting blocks AND THEIR NAMES from the model.
-        """
         named_blocks = []
-        for stage_name in ["layer1", "layer2", "layer3", "layer4"]:
-            stage = getattr(model, stage_name)
-            for i, block in enumerate(stage):
-                named_blocks.append((f"{stage_name}.{i}", block))
         
-        return named_blocks
+        all_quantizable_layers = find_modules(model, [nn.Conv2d, nn.Linear])
+        
+        layers_to_quantize = []
+        for name, module in all_quantizable_layers.items():
+            if name == "conv1" or name == "fc":
+                continue
+            layers_to_quantize.append((name, module))
+            
+        return layers_to_quantize
 
     def prepare_dataset(
         self,
         calibration_dataset: Union[List[Image], Dataset],
         batch_size: int = 1,
         **kwargs
-    ) -> List[Dict[str, torch.Tensor]]:
-        """
-        Overrides the base method to prepare an image dataset for calibration.
-        """
+    ) -> List[torch.Tensor]:
         image_transforms = transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
@@ -80,6 +76,8 @@ class ResNet50GPTQ(BaseGPTQModel):
 
             def __getitem__(self, idx):
                 img = self.images[idx]
+                if not isinstance(img, Image.Image):
+                    img = transforms.ToPILImage()(img)
                 return self.transform(img)
 
         if isinstance(calibration_dataset, list):
@@ -93,6 +91,6 @@ class ResNet50GPTQ(BaseGPTQModel):
         
         batched_data = []
         for batch in data_loader:
-            batched_data.append({'x': batch})
+            batched_data.append(batch)
             
         return batched_data
