@@ -31,7 +31,7 @@ from ..utils.importer import auto_select_device, normalize_device_device_map, se
 from ..utils.logger import setup_logger
 from ..utils.model import (auto_dtype, find_modules, get_checkpoints,
                            get_moe_layer_modules, gptqmodel_post_init, load_checkpoint_in_model_then_tie_weights,
-                           make_quant, simple_dispatch_model, verify_model_hash, verify_sharded_model_hashes)
+                           make_quant, simple_dispatch_model, verify_model_hash, verify_sharded_model_hashes, get_module)
 from ._const import DEVICE, normalize_device
 
 log = setup_logger()
