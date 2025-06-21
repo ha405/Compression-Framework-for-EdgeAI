@@ -427,10 +427,10 @@ class PackableQuantLinear(BaseQuantLinear):
         # 5) Quantize
         intW = t.round((W / exp_s) + exp_z).to(t.int32)
 
-        # 6) Store float16 metadata
-        self.scales = scales.clone().to(torch.float16)
+        # 6) Store float16 metadata (use t.float16)
+        self.scales = scales.clone().to(t.float16)
         if linear.bias is not None:
-            self.bias = linear.bias.clone().to(torch.float16)
+            self.bias = linear.bias.clone().to(t.float16)
 
         # 7) Pad to multiple of pack_factor
         pad = (-in_total) % self.pack_factor
@@ -448,7 +448,7 @@ class PackableQuantLinear(BaseQuantLinear):
             for r in range(num_rows):
                 for j in range(self.pack_factor):
                     qw[r] |= int_np[r*self.pack_factor + j] << (self.bits * j)
-        else:  # 3-bit
+        else:  # 3‑bit
             i = row = 0
             while row < num_rows:
                 for j in range(i, i+10):
@@ -468,13 +468,10 @@ class PackableQuantLinear(BaseQuantLinear):
         self.qweight = t.from_numpy(qw.astype(self.pack_np_dtype))
 
         # 10) Bit‑pack zeros into [num_groups, out//pack_factor]
-        # Recover zeros per-groups × out_features
         if zeros.shape == (num_groups, out_features):
             zeros_np = zeros.cpu().numpy()
         else:
             zeros_np = zeros.T.cpu().numpy()
-
-        # **Critical cast** to unsigned int for bit‑shifts
         zeros_np = zeros_np.astype(self.pack_np_math_dtype)
 
         qz = np.zeros((num_groups, out_features // self.pack_factor),
