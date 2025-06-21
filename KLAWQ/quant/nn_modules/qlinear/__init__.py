@@ -441,7 +441,6 @@ class PackableQuantLinear(BaseQuantLinear):
         print(f"[DEBUG] pack_factor  = {self.pack_factor}")
         print(f"[DEBUG] group_size   = {self.group_size}")
         print(f"[DEBUG] in_features  = {self.in_features}")
-        print(f"[DEBUG] kernel_elems = {kernel_elems}")
 
         # 5) Quantize: round(W / scale + zero)
         intW = t.round((W / exp_s) + exp_z).to(t.int32)
