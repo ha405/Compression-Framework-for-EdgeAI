@@ -246,14 +246,14 @@ class PackableQuantLinear(BaseQuantLinear):
             zeros = t.bitwise_and(zeros, self.maxq).reshape(self.scales.shape)
             weight = t.bitwise_right_shift(t.unsqueeze(self.qweight, 1).expand(-1, self.pack_factor, -1), self.wf_unsqueeze_neg_one)
             weight = t.bitwise_and(weight, self.maxq).reshape(-1, self.out_features)
-        else:
+        elif self.bits == 3:
             zeros = self.qzeros.reshape(self.qzeros.shape[0], self.qzeros.shape[1] // 3, 3, 1).expand(-1,-1,-1,12) >> self.wf_unsqueeze_zero
             zeros[:,:,0,10] = (zeros[:,:,0,10]&3)|((zeros[:,:,1,0]<<2)&4); zeros[:,:,1,11] = (zeros[:,:,1,11]&1)|((zeros[:,:,2,0]<<1)&6)
             zeros = t.cat([zeros[:,:,0,:11], zeros[:,:,1,1:12], zeros[:,:,2,1:11]], dim=2).reshape(self.scales.shape)
             weight = self.qweight.reshape(self.qweight.shape[0]//3,3,1,self.qweight.shape[1]).expand(-1,-1,12,-1) >> self.wf_unsqueeze_neg_one
             weight[:,0,10] = (weight[:,0,10]&3)|((weight[:,1,0]<<2)&4); weight[:,1,11] = (weight[:,1,11]&1)|((weight[:,2,0]<<1)&6)
             weight = t.cat([weight[:,0,:11], weight[:,1,1:12], weight[:,2,1:11]], dim=1).reshape(-1, self.out_features)
-
+        
         weight = weight[:self.in_features]
         weights = self.scales[self.g_idx.long()] * (weight - zeros[self.g_idx.long()])
         return weights
@@ -270,23 +270,23 @@ class PackableQuantLinear(BaseQuantLinear):
         # --- START OF THE DEFINITIVE FIX ---
         # `scales` and `zeros` are passed with shape (num_groups, out_features)
         # `W` has shape (out_features, in_features)
+        # `g_idx` has shape (in_features)
         
-        # Transpose W to align features with g_idx
-        W_t = W.T # Shape: [in_features, out_features]
+        # We must transpose W to align its `in_features` dimension with `g_idx`
+        W_t = W.T.contiguous() # Shape: [in_features, out_features]
         
-        # Expand scales and zeros to match the dimensions of the transposed weight tensor
-        # `g_idx` has shape [in_features], mapping each input feature to a group index.
-        # `scales` and `zeros` have shape [num_groups, out_features].
-        # Indexing them with g_idx creates tensors of shape [in_features, out_features].
-        
+        # Expand scales and zeros to match the dimensions of the transposed weight tensor.
+        # This is the correct way to broadcast per-group parameters to per-feature.
         expanded_scales = scales[self.g_idx.long()]
         expanded_zeros = zeros[self.g_idx.long()]
         
         # Now the formula Q = round(W_T/S + Z) is applied element-wise with correct shapes.
-        int_weight = t.round((W_t / expanded_scales) + expanded_zeros).to(t.int32)
-        # --- END OF THE DEFINITIVE FIX ---
-
+        int_weight = t.round(W_t / expanded_scales + expanded_zeros).to(t.int32)
+        
+        # The original scales are stored.
         self.scales = scales.clone().to(dtype=t.float16)
+        # --- END OF THE DEFINITIVE FIX ---
+        
         if linear.bias is not None:
             self.bias = linear.bias.clone().to(dtype=t.float16)
         
@@ -322,23 +322,24 @@ class PackableQuantLinear(BaseQuantLinear):
         
         self.qweight = t.from_numpy(qweight.astype(self.pack_np_dtype))
         
-        zeros_np = zeros.numpy().astype(self.pack_np_math_dtype)
-        qzeros = np.zeros((zeros_np.shape[0], zeros_np.shape[1] // self.pack_factor), dtype=self.pack_np_math_dtype)
+        # Unpack zeros before bit-packing them
+        unpacked_zeros = zeros.numpy().astype(self.pack_np_math_dtype)
+        qzeros = np.zeros((unpacked_zeros.shape[0], unpacked_zeros.shape[1] // self.pack_factor), dtype=self.pack_np_math_dtype)
         if self.bits in [2, 4, 8]:
-            for row in range(qzeros.shape[0]):
-                for col in range(qzeros.shape[1]):
+            for row in range(qzeros.shape[0]): # Iterate through groups
+                for col in range(qzeros.shape[1]): # Iterate through packed columns
                      for j in range(self.pack_factor):
-                        qzeros[row, col] |= zeros_np[row, col * self.pack_factor + j] << (self.bits * j)
+                        qzeros[row, col] |= unpacked_zeros[row, col * self.pack_factor + j] << (self.bits * j)
         elif self.bits == 3:
             i, col = 0, 0
             while col < qzeros.shape[1]:
-                for j in range(i, i + 10): qzeros[:, col] |= zeros_np[:, j] << (3 * (j - i));
-                i += 10; qzeros[:, col] |= zeros_np[:, i] << 30; col += 1
-                qzeros[:, col] |= (zeros_np[:, i] >> 2) & 1; i += 1
-                for j in range(i, i + 10): qzeros[:, col] |= zeros_np[:, j] << (3 * (j - i) + 1);
-                i += 10; qzeros[:, col] |= zeros_np[:, i] << 31; col += 1
-                qzeros[:, col] |= (zeros_np[:, i] >> 1) & 0x3; i += 1
-                for j in range(i, i + 10): qzeros[:, col] |= zeros_np[:, j] << (3 * (j - i) + 2);
+                for j in range(i, i + 10): qzeros[:, col] |= unpacked_zeros[:, j] << (3 * (j - i));
+                i += 10; qzeros[:, col] |= unpacked_zeros[:, i] << 30; col += 1
+                qzeros[:, col] |= (unpacked_zeros[:, i] >> 2) & 1; i += 1
+                for j in range(i, i + 10): qzeros[:, col] |= unpacked_zeros[:, j] << (3 * (j - i) + 1);
+                i += 10; qzeros[:, col] |= unpacked_zeros[:, i] << 31; col += 1
+                qzeros[:, col] |= (unpacked_zeros[:, i] >> 1) & 0x3; i += 1
+                for j in range(i, i + 10): qzeros[:, col] |= unpacked_zeros[:, j] << (3 * (j - i) + 2);
                 i += 10; col += 1
         
         self.qzeros = t.from_numpy(qzeros.astype(self.pack_np_dtype))
