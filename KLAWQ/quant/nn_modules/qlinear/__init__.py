@@ -394,117 +394,100 @@ class PackableQuantLinear(BaseQuantLinear):
              scales: t.Tensor,
              zeros: t.Tensor,
              g_idx: t.Tensor = None):
-        # 1) Grab and reshape weight as [out_features, in_features]
+        # 1) Pull out the weight & flatten convs to [out, in_total]
         W = linear.weight.data.clone()
         if isinstance(linear, _ConvNd):
-            W = W.flatten(1)       # [out, in]
-        # HuggingFace Conv1D is already [out, in], so no transpose
-        # nn.Linear is [out, in] by default
-
-        # 2) Group index mapping
-        self.g_idx = g_idx.clone() if g_idx is not None else self.g_idx
-
-        # 3) Prepare scale & zero maps as [out_features, num_groups]
-        scales = scales.T.contiguous()
-        zeros  = zeros.T.contiguous()
-
-        # 4) Expand them to [out, in] via group indices
-        if W.shape == (self.out_features, self.in_features):
-            expanded_scales = scales[:, self.g_idx.long()]   # → [out, in]
-            expanded_zeros  = zeros[:,  self.g_idx.long()]   # → [out, in]
+            # e.g. Conv2d: weight.shape = [out, in, kH, kW]
+            in_channels = W.shape[1]
+            kernel_elems = int(W.numel() / (W.shape[0] * in_channels))
+            W = W.flatten(1)                        # [out, in*kernel_elems]
+        elif isinstance(linear, transformers.pytorch_utils.Conv1D):
+            # HF Conv1D: weight stored as [in, out]
+            W = W.T                                 # → [out, in]
+            in_channels, kernel_elems = W.shape[1], 1
         else:
-            raise RuntimeError(f"Unexpected weight shape {W.shape}, "
-                               f"expected ({self.out_features}, {self.in_features})")
+            # nn.Linear: [out, in]
+            in_channels = W.shape[1]
+            kernel_elems = 1
 
-        # 5) Quantize to integers
-        int_weight = t.round((W / expanded_scales) + expanded_zeros).to(t.int32)
+        out_features, in_total = W.shape
+        assert out_features == self.out_features, f"out mismatch: {out_features} vs {self.out_features}"
 
-        # 6) Store back float16 metadata
-        self.scales = scales.T.clone().to(dtype=t.float16)
+        # 2) Build a full-length group-index for every input column
+        base_gidx = (g_idx.clone() if g_idx is not None else self.g_idx).long()
+        if kernel_elems > 1:
+            # repeat each channel index `kernel_elems` times
+            g_idx_full = base_gidx.repeat_interleave(kernel_elems)
+        else:
+            g_idx_full = base_gidx
+        assert g_idx_full.shape[0] == in_total
+
+        # 3) Prepare scales/zeros as [out_features, num_groups]
+        scales_o2g = scales.T.contiguous()   # [out, num_groups]
+        zeros_o2g  = zeros.T.contiguous()    # [out, num_groups]
+
+        # 4) Expand to [out, in_total] via g_idx_full
+        expanded_scales = scales_o2g[:, g_idx_full]  # → [out, in_total]
+        expanded_zeros  = zeros_o2g[:,  g_idx_full]  # → [out, in_total]
+
+        # 5) Quantize to int32
+        intW = t.round((W / expanded_scales) + expanded_zeros).to(t.int32)
+
+        # 6) Save float16 metadata
+        self.scales = scales_o2g.T.clone().to(dtype=t.float16)
         if linear.bias is not None:
             self.bias = linear.bias.clone().to(dtype=t.float16)
 
-        # 7) Pad in_features up to a multiple of pack_factor
-        padded_in = self.in_features
-        if padded_in % self.pack_factor != 0:
-            pad = self.pack_factor - (padded_in % self.pack_factor)
-            pad_tensor = int_weight.new_zeros(self.out_features, pad)
-            int_weight = t.cat([int_weight, pad_tensor], dim=1)
-            padded_in += pad
+        # 7) Pad columns to multiple of pack_factor
+        pad = (-in_total) % self.pack_factor
+        if pad:
+            pad_tensor = intW.new_zeros(out_features, pad)
+            intW = t.cat([intW, pad_tensor], dim=1)
+            in_total += pad
 
-        # 8) Transpose to [in_padded, out] and move to numpy
-        int_np = int_weight.T.contiguous().cpu().numpy().astype(self.pack_np_math_dtype)
-        # Prepare empty qweight buffer
-        qweight = np.zeros((int_np.shape[0] // self.pack_factor, int_np.shape[1]),
-                           dtype=self.pack_np_math_dtype)
+        # 8) Move to numpy as shape [in_padded, out]
+        int_np = intW.T.contiguous().cpu().numpy().astype(self.pack_np_math_dtype)
+        qw = np.zeros((in_total // self.pack_factor, out_features),
+                      dtype=self.pack_np_math_dtype)
 
-        # 9) Bit‑pack weights (2/4/8-bit vs 3-bit cases)
+        # 9) Bit‑pack the weights
         if self.bits in [2, 4, 8]:
-            for row in range(qweight.shape[0]):
+            for r in range(qw.shape[0]):
                 for j in range(self.pack_factor):
-                    qweight[row] |= int_np[row * self.pack_factor + j] << (self.bits * j)
-        else:  # bits == 3
-            i = 0
-            row = 0
-            while row < qweight.shape[0]:
-                # first 10 values
-                for j in range(i, i + 10):
-                    qweight[row] |= int_np[j] << (3 * (j - i))
-                i += 10
-                # 11th value
-                qweight[row] |= int_np[i] << 30
-                row += 1
+                    qw[r] |= int_np[r * self.pack_factor + j] << (self.bits * j)
+        else:  # 3‑bit special
+            i = 0; row = 0
+            while row < qw.shape[0]:
+                for j in range(i, i+10):    qw[row] |= int_np[j] << (3*(j-i))
+                i += 10;  qw[row] |= int_np[i] << 30;  row += 1
+                qw[row] |= (int_np[i] >> 2) & 1;  i += 1
+                for j in range(i, i+10):    qw[row] |= int_np[j] << (3*(j-i)+1)
+                i += 10;  qw[row] |= int_np[i] << 31;  row += 1
+                qw[row] |= (int_np[i] >> 1) & 0x3; i += 1
+                for j in range(i, i+10):    qw[row] |= int_np[j] << (3*(j-i)+2)
+                i += 10;  row += 1
 
-                # spillover bits
-                qweight[row] |= (int_np[i] >> 2) & 1
-                i += 1
-                # next 10
-                for j in range(i, i + 10):
-                    qweight[row] |= int_np[j] << (3 * (j - i) + 1)
-                i += 10
-                qweight[row] |= int_np[i] << 31
-                row += 1
+        self.qweight = t.from_numpy(qw.astype(self.pack_np_dtype))
 
-                qweight[row] |= (int_np[i] >> 1) & 0x3
-                i += 1
-                for j in range(i, i + 10):
-                    qweight[row] |= int_np[j] << (3 * (j - i) + 2)
-                i += 10
-                row += 1
+        # 10) Pack the zeros exactly the same way
+        zeros_np = zeros_o2g.cpu().numpy().astype(self.pack_np_math_dtype)  # [out, num_groups]
+        qz = np.zeros((zeros_np.shape[0], zeros_np.shape[1] // self.pack_factor),
+                      dtype=self.pack_np_math_dtype)
 
-        self.qweight = t.from_numpy(qweight.astype(self.pack_np_dtype))
-
-        # 10) Now pack zeros in the same layout:
-        zeros_np = zeros.cpu().numpy().astype(self.pack_np_math_dtype)  # [out, num_groups]
-        qzeros   = np.zeros((zeros_np.shape[0], zeros_np.shape[1] // self.pack_factor),
-                            dtype=self.pack_np_math_dtype)
         if self.bits in [2, 4, 8]:
-            for col in range(qzeros.shape[1]):
+            for c in range(qz.shape[1]):
                 for j in range(self.pack_factor):
-                    qzeros[:, col] |= zeros_np[:, col * self.pack_factor + j] << (self.bits * j)
-        else:  # bits == 3
-            i = 0
-            col = 0
-            while col < qzeros.shape[1]:
-                for j in range(i, i + 10):
-                    qzeros[:, col] |= zeros_np[:, j] << (3 * (j - i))
-                i += 10
-                qzeros[:, col] |= zeros_np[:, i] << 30
-                col += 1
+                    qz[:, c] |= zeros_np[:, c*self.pack_factor + j] << (self.bits * j)
+        else:  # 3‑bit
+            i = 0; col = 0
+            while col < qz.shape[1]:
+                for j in range(i, i+10):  qz[:, col] |= zeros_np[:, j] << (3*(j-i))
+                i += 10;  qz[:, col] |= zeros_np[:, i] << 30;  col += 1
+                qz[:, col] |= (zeros_np[:, i] >> 2) & 1; i += 1
+                for j in range(i, i+10):  qz[:, col] |= zeros_np[:, j] << (3*(j-i)+1)
+                i += 10;  qz[:, col] |= zeros_np[:, i] << 31;  col += 1
+                qz[:, col] |= (zeros_np[:, i] >> 1) & 0x3; i += 1
+                for j in range(i, i+10):  qz[:, col] |= zeros_np[:, j] << (3*(j-i)+2)
+                i += 10;  col += 1
 
-                qzeros[:, col] |= (zeros_np[:, i] >> 2) & 1
-                i += 1
-                for j in range(i, i + 10):
-                    qzeros[:, col] |= zeros_np[:, j] << (3 * (j - i) + 1)
-                i += 10
-                qzeros[:, col] |= zeros_np[:, i] << 31
-                col += 1
-
-                qzeros[:, col] |= (zeros_np[:, i] >> 1) & 0x3
-                i += 1
-                for j in range(i, i + 10):
-                    qzeros[:, col] |= zeros_np[:, j] << (3 * (j - i) + 2)
-                i += 10
-                col += 1
-
-        self.qzeros = t.from_numpy(qzeros.astype(self.pack_np_dtype))
+        self.qzeros = t.from_numpy(qz.astype(self.pack_np_dtype))
