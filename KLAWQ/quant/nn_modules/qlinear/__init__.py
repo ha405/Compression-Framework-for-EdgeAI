@@ -395,31 +395,28 @@ class PackableQuantLinear(BaseQuantLinear):
              zeros: t.Tensor,
              g_idx: t.Tensor = None):
         """
-        Quantize & bit‑pack `linear.weight` into self.qweight/self.qzeros.
+        Quantize & bit-pack `linear.weight` into self.qweight/self.qzeros.
         Handles nn.Linear, HF Conv1D, and torch._ConvNd by flattening.
         """
-        # 1) Extract weight as [out_features, in_total]
+        # 1) Extract weight as [out, in_total]
         W = linear.weight.data.clone()
         if isinstance(linear, _ConvNd):
-            W = W.flatten(1)             # conv: [out, in * kernel]
+            W = W.flatten(1)
         elif isinstance(linear, transformers.pytorch_utils.Conv1D):
-            W = W.T                      # HF Conv1D: transpose to [out, in]
+            W = W.T
         out_features, in_total = W.shape
 
         # 2) Build full-length group index
         base_gidx = (g_idx.clone() if g_idx is not None else self.g_idx).long()
-        # repeat per kernel element if needed
         kernel_elems = in_total // base_gidx.shape[0]
         g_idx_full = base_gidx.repeat_interleave(kernel_elems) if kernel_elems > 1 else base_gidx
 
-        # 3) Normalize scales/zeros to shape [out, num_groups]
+        # 3) Normalize scales/zeros to [out, num_groups]
         num_groups = math.ceil(self.in_features / self.group_size)
         if scales.shape == (num_groups, out_features):
-            # incoming is [groups, out] → transpose
             scales_og = scales.T.contiguous()
             zeros_og  = zeros.T.contiguous()
         else:
-            # assume incoming is [out, groups]
             scales_og = scales.contiguous()
             zeros_og  = zeros.contiguous()
 
@@ -427,22 +424,22 @@ class PackableQuantLinear(BaseQuantLinear):
         exp_s = scales_og[:, g_idx_full]
         exp_z = zeros_og[:,  g_idx_full]
 
-        # 5) Quantize to int32
+        # 5) Quantize
         intW = t.round((W / exp_s) + exp_z).to(t.int32)
 
         # 6) Store float16 metadata
-        self.scales = scales.clone().to(dtype=t.float16)
+        self.scales = scales.clone().to(torch.float16)
         if linear.bias is not None:
-            self.bias = linear.bias.clone().to(dtype=t.float16)
+            self.bias = linear.bias.clone().to(torch.float16)
 
-        # 7) Pad in_total to multiple of pack_factor
+        # 7) Pad to multiple of pack_factor
         pad = (-in_total) % self.pack_factor
         if pad:
             intW = t.cat([intW, intW.new_zeros(out_features, pad)], dim=1)
             in_total += pad
 
-        # 8) Move weight to numpy [in_padded, out]
-        int_np = intW.T.contiguous().cpu().numpy().astype(self.pack_np_math_dtype)
+        # 8) Move to NumPy [in_padded, out]
+        int_np = intW.T.cpu().numpy().astype(self.pack_np_math_dtype)
         num_rows = in_total // self.pack_factor
 
         # 9) Bit‑pack weights
@@ -450,39 +447,35 @@ class PackableQuantLinear(BaseQuantLinear):
         if self.bits in [2, 4, 8]:
             for r in range(num_rows):
                 for j in range(self.pack_factor):
-                    qw[r] |= int_np[r * self.pack_factor + j] << (self.bits * j)
-        else:  # 3‑bit
+                    qw[r] |= int_np[r*self.pack_factor + j] << (self.bits * j)
+        else:  # 3-bit
             i = row = 0
             while row < num_rows:
-                for j in range(i, i + 10):
-                    qw[row] |= int_np[j] << (3 * (j - i))
+                for j in range(i, i+10):
+                    qw[row] |= int_np[j] << (3*(j-i))
                 i += 10
-                qw[row] |= int_np[i] << 30
-                row += 1
-
-                qw[row] |= (int_np[i] >> 2) & 1
-                i += 1
-                for j in range(i, i + 10):
-                    qw[row] |= int_np[j] << (3 * (j - i) + 1)
+                qw[row] |= int_np[i] << 30; row += 1
+                qw[row] |= (int_np[i] >> 2) & 1; i += 1
+                for j in range(i, i+10):
+                    qw[row] |= int_np[j] << (3*(j-i)+1)
                 i += 10
-                qw[row] |= int_np[i] << 31
-                row += 1
-
-                qw[row] |= (int_np[i] >> 1) & 0x3
-                i += 1
-                for j in range(i, i + 10):
-                    qw[row] |= int_np[j] << (3 * (j - i) + 2)
-                i += 10
-                row += 1
+                qw[row] |= int_np[i] << 31; row += 1
+                qw[row] |= (int_np[i] >> 1) & 0x3; i += 1
+                for j in range(i, i+10):
+                    qw[row] |= int_np[j] << (3*(j-i)+2)
+                i += 10; row += 1
 
         self.qweight = t.from_numpy(qw.astype(self.pack_np_dtype))
 
         # 10) Bit‑pack zeros into [num_groups, out//pack_factor]
-        # recover zeros per-group × out_features
+        # Recover zeros per-groups × out_features
         if zeros.shape == (num_groups, out_features):
             zeros_np = zeros.cpu().numpy()
         else:
             zeros_np = zeros.T.cpu().numpy()
+
+        # **Critical cast** to unsigned int for bit‑shifts
+        zeros_np = zeros_np.astype(self.pack_np_math_dtype)
 
         qz = np.zeros((num_groups, out_features // self.pack_factor),
                       dtype=self.pack_np_math_dtype)
