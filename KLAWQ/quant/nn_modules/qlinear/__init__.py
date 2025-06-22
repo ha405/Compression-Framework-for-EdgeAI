@@ -352,42 +352,72 @@ class PackableQuantLinear(BaseQuantLinear):
         ]
 
     def dequantize_weight(self, num_itr: int = 1):
-        # --- START OF THE DEFINITIVE FIX ---
-        # 1. Unpack qzeros to get a tensor of shape (num_groups, out_features)
+        # 1) Unpack qzeros → (num_groups, out_features)
         if self.bits in [2, 4, 8]:
-            zeros = t.bitwise_right_shift(t.unsqueeze(self.qzeros, 2).expand(-1, -1, self.pack_factor), self.wf_unsqueeze_zero)
-            zeros = t.bitwise_and(zeros, self.maxq).reshape(self.scales.shape)
-        else: # bits == 3
-            zeros = self.qzeros.reshape(self.qzeros.shape[0], self.qzeros.shape[1] // 3, 3, 1).expand(-1, -1, -1, 12)
+            zeros = (
+                t.bitwise_and(
+                    t.bitwise_right_shift(
+                        t.unsqueeze(self.qzeros, 2).expand(-1, -1, self.pack_factor),
+                        self.wf_unsqueeze_zero
+                    ),
+                    self.maxq
+                )
+                .reshape(self.scales.shape)
+            )
+        else:  # 3-bit special
+            zeros = (
+                self.qzeros
+                .reshape(self.qzeros.shape[0], self.qzeros.shape[1] // 3, 3, 1)
+                .expand(-1, -1, -1, 12)
+            )
             zeros = zeros >> self.wf_unsqueeze_zero
             zeros[:, :, 0, 10] = (zeros[:, :, 0, 10] & 0x3) | ((zeros[:, :, 1, 0] << 2) & 0x4)
             zeros[:, :, 1, 11] = (zeros[:, :, 1, 11] & 0x1) | ((zeros[:, :, 2, 0] << 1) & 0x6)
-            zeros = zeros & 0x7
-            zeros = t.cat([zeros[:, :, 0, :11], zeros[:, :, 1, 1:12], zeros[:, :, 2, 1:11]], dim=2).reshape(self.scales.shape)
+            zeros = (zeros & 0x7)
+            zeros = (
+                t.cat([zeros[:, :, 0, :11],
+                       zeros[:, :, 1, 1:12],
+                       zeros[:, :, 2, 1:11]], dim=2)
+                .reshape(self.scales.shape)
+            )
 
-        # 2. Unpack qweight to get a tensor of shape (padded_in_features, out_features)
+        # 2) Unpack qweight → (padded_in_features, out_features)
         if self.bits in [2, 4, 8]:
-            weight = t.bitwise_right_shift(t.unsqueeze(self.qweight, 1).expand(-1, self.pack_factor, -1), self.wf_unsqueeze_neg_one)
-            weight = t.bitwise_and(weight, self.maxq)
-            weight = weight.reshape(-1, self.out_features)
-        else: # bits == 3
-            weight = self.qweight.reshape(self.qweight.shape[0] // 3, 3, 1, self.qweight.shape[1]).expand(-1, -1, 12, -1)
+            weight = (
+                t.bitwise_and(
+                    t.bitwise_right_shift(
+                        t.unsqueeze(self.qweight, 1).expand(-1, self.pack_factor, -1),
+                        self.wf_unsqueeze_neg_one
+                    ),
+                    self.maxq
+                )
+                .reshape(-1, self.out_features)
+            )
+        else:  # 3-bit special
+            weight = (
+                self.qweight
+                .reshape(self.qweight.shape[0] // 3, 3, 1, self.qweight.shape[1])
+                .expand(-1, -1, 12, -1)
+            )
             weight = (weight >> self.wf_unsqueeze_neg_one) & 0x7
             weight[:, 0, 10] = (weight[:, 0, 10] & 0x3) | ((weight[:, 1, 0] << 2) & 0x4)
             weight[:, 1, 11] = (weight[:, 1, 11] & 0x1) | ((weight[:, 2, 0] << 1) & 0x6)
             weight = weight & 0x7
-            weight = t.cat([weight[:, 0, :11], weight[:, 1, 1:12], weight[:, 2, 1:11]], dim=1)
-            weight = weight.reshape(-1, self.out_features)
+            weight = (
+                t.cat([weight[:, 0, :11],
+                       weight[:, 1, 1:12],
+                       weight[:, 2, 1:11]], dim=1)
+                .reshape(-1, self.out_features)
+            )
 
-        # 3. Slice the unpacked weight to match the true `in_features` dimension, removing any padding.
-        weight = weight[:self.in_features, :]
-        
-        # 4. Use g_idx to expand scales and zeros to match the weight tensor's shape.
-        # This is the only robust way to handle grouping for all cases.
-        weights = self.scales[self.g_idx.long()] * (weight - zeros[self.g_idx.long()])
-        # --- END OF THE DEFINITIVE FIX ---
+        # 3) Trim off any pad so we only have exactly in_features rows
+        weight = weight[: self.in_features, :]
 
-        return weights
+        # 4) Finally dequantize per-group via g_idx
+        #    scales & zeros are (num_groups, out_features)
+        #    g_idx is length in_features → for each row choose its group
+        return self.scales[self.g_idx.long()] * (weight - zeros[self.g_idx.long()])
+
 
     def pack(self,
              linear: nn.Module,
