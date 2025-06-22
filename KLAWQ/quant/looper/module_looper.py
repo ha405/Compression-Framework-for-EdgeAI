@@ -218,7 +218,7 @@ class ModuleLooper():
                             else:
                                 full_submodule_name = f"{layer_name}.{name}"
                             short_name_for_hook = name.split('.')[-1]
-                            named_module = NamedModule(instance=submodule_instance, name=short_name_for_hook,
+                            named_module = NamedModule(submodule_instance, name=short_name_for_hook,
                                                       full_name=full_submodule_name, layer_index=layer_index)
                             subset[name] = named_module
                         
