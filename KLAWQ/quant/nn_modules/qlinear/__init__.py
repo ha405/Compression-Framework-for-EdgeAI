@@ -208,6 +208,8 @@ class BaseQuantLinear(nn.Module):
     @classmethod
     def _validate(cls, bits: int=4, group_size: int=128, desc_act: bool=False, sym: bool=False, pack_dtype:t.dtype=None, dynamic:Optional[dict]=None, in_features:int=None,
                   out_features:int=None, device:Optional[DEVICE]=None, trainable:Optional[bool]=None) -> Tuple[bool, Optional[Exception]]:
+        if group_size == -1 and in_features is not None:
+            group_size = in_features
         cls.verify_supports_params()
 
         if pack_dtype not in cls.SUPPORTS_PACK_DTYPES:
