@@ -41,23 +41,19 @@ class ModuleLooper():
             if len(layer_input) == 0:
                 if kwargs.get("hidden_states") is not None:
                     layer_input.append(move_to(kwargs["hidden_states"], device=data_device))
-
             layer_inputs.append(layer_input)
-
             if kwargs.get("attention_mask") is not None:
                 attention_masks.append(kwargs["attention_mask"].to(device=data_device))
             else:
                 attention_masks.append(None)
-
             pos_ids = kwargs.get("position_ids", None)
             if pos_ids is not None:
                 position_ids.append(move_to(pos_ids, device=data_device))
             one_kwargs = {}
-            for (k, v) in kwargs.items():
+            for k, v in kwargs.items():
                 if k not in ["hidden_states", "attention_mask", "position_ids"]:
                     one_kwargs[k] = nested_move_to(v, device=data_device)
             layer_input_kwargs.append(one_kwargs)
-
             raise ValueError
 
         layers[0] = layers[0].to(self.gptq_model.quantize_config.device)
@@ -65,13 +61,10 @@ class ModuleLooper():
         if hasattr(self.gptq_model, 'base_modules') and self.gptq_model.base_modules:
             for module_name in self.gptq_model.base_modules:
                 module, _ = get_module_by_name_prefix(self.gptq_model.model, [module_name])
-                if module is None:
-                    continue
+                if module is None: continue
                 ori_outside_layer_module_devices[module_name] = get_device(module)
-                if module is not None:
-                    move_to(module, cur_layer_device)
+                if module is not None: move_to(module, cur_layer_device)
         handle = layers[0].register_forward_pre_hook(store_input_hook, with_kwargs=True)
-        
         self.gptq_model.pre_quantize_generate_hook_start()
         for example in calibration_data:
             for k, v in example.items():
@@ -91,10 +84,8 @@ class ModuleLooper():
                 module, _ = get_module_by_name_prefix(self.gptq_model.model, [module_name])
                 if module is not None:
                     move_to(module, device=ori_outside_layer_module_devices[module_name])
-        if auto_gc:
-            torch_empty_cache()
-        return InputCache(layer_inputs=layer_inputs, layer_input_kwargs=layer_input_kwargs, position_ids=position_ids,
-                          attention_masks=attention_masks)
+        if auto_gc: torch_empty_cache()
+        return InputCache(layer_inputs=layer_inputs, layer_input_kwargs=layer_input_kwargs, position_ids=position_ids, attention_masks=attention_masks)
 
     @torch.no_grad()
     def loop(self, auto_gc=True, calibration_enable_gpu_cache=True, buffered_fwd=False, **kwargs):
@@ -123,15 +114,12 @@ class ModuleLooper():
         else:
             forward_pass_use_cache = False
             
-        # =================================================================================
-        # START OF MINIMAL, CORRECT FIX
-        # =================================================================================
-        
-        # Prepare calibration data once
+        # Get the prepared calibration data from the main processor
         main_processor = self.processors[0]
-        if not main_processor.prepared:
-            main_processor.prepare_dataset()
         calibration_data = main_processor.calibration_dataset
+        if calibration_data is None:
+            raise ValueError("Calibration dataset is not prepared. It must be loaded before calling loop.")
+        
         model_device = self.gptq_model.quantize_config.device
         for i, data in enumerate(calibration_data):
             calibration_data[i] = nested_move_to(data, model_device)
@@ -147,7 +135,6 @@ class ModuleLooper():
                 
                 log.info(f"Quantizing base module: {module_name}")
 
-                # Capture the correct inputs for THIS specific module
                 inputs_cache = []
                 data_device = model_device if calibration_enable_gpu_cache else CPU
                 def store_input_hook(_, args, kwargs):
@@ -160,7 +147,6 @@ class ModuleLooper():
                     except ValueError: pass
                 handle.remove()
 
-                # Process this single module
                 named_module = NamedModule(module, name=module_name, full_name=module_name, layer_index=-1)
                 for processor in self.processors:
                     if isinstance(processor, GPTQProcessor):
@@ -173,11 +159,7 @@ class ModuleLooper():
 
                 if auto_gc: torch_empty_cache()
 
-        # =================================================================================
         # B. ORIGINAL LOGIC FOR MAIN BLOCKS (layer1, layer2, etc.)
-        # This part is left as it was, because it works for the sequential blocks.
-        # =================================================================================
-
         if hasattr(self.gptq_model, "get_layers") and self.gptq_model.get_layers is not None:
             layers_with_names = self.gptq_model.get_layers(self.gptq_model.model)
             layers = [module for _, module in layers_with_names]
@@ -192,7 +174,6 @@ class ModuleLooper():
                     processor.set_calibration_dataset(copy.copy(prev_processor.calibration_dataset))
                     processor.receive_input_cache(copy.copy(prev_processor.inputs_cache))
                 continue
-            # The original cache_inputs function is now used only for the main blocks
             input_cache = self.cache_inputs(layers=layers, auto_gc=auto_gc,
                                             calibration_data=main_processor.calibration_dataset,
                                             calibration_enable_gpu_cache=calibration_enable_gpu_cache)
@@ -217,6 +198,7 @@ class ModuleLooper():
         else:
             replace_module_with_hooked_legacy(self.gptq_model.model)
 
+        log.info(f"Processing {len(layers_with_names)} main layer blocks...")
         for layer_index, (layer_name, module) in enumerate(layers_with_names):
             quant_modules_pb.next()
             quant_modules_pb.title(f"Quantizing block {layer_name}").draw()
@@ -281,7 +263,6 @@ class ModuleLooper():
 
             if auto_gc: torch_empty_cache()
 
-        # Finalize all processors
         for reverse_p in reversed(self.processors):
             reverse_p.finalize(model=self.gptq_model, **kwargs)
         
