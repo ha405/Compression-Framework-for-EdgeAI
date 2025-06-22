@@ -210,15 +210,15 @@ class ModuleLooper():
                             raise ValueError(f"layer module item `{n}` not found in model, please check your model config.")
 
                     skipped_modules = []
-                    for name in subset:
+                    for name in list(subset.keys()):
                         submodule_instance = subset[name]
                         if not isinstance(submodule_instance, NamedModule):
                             if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
                                 full_submodule_name = name
                             else:
                                 full_submodule_name = f"{layer_name}.{name}"
-                            short_name_for_hook = name.split('.')[-1]
-                            named_module = NamedModule(submodule_instance, name=short_name_for_hook,
+                            
+                            named_module = NamedModule(submodule_instance, name=name,
                                                       full_name=full_submodule_name, layer_index=layer_index)
                             subset[name] = named_module
                         
