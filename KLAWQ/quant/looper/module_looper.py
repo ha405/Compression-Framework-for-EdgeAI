@@ -114,7 +114,6 @@ class ModuleLooper():
         else:
             forward_pass_use_cache = False
             
-        # Get the prepared calibration data from the main processor
         main_processor = self.processors[0]
         calibration_data = main_processor.calibration_dataset
         if calibration_data is None:
@@ -124,7 +123,6 @@ class ModuleLooper():
         for i, data in enumerate(calibration_data):
             calibration_data[i] = nested_move_to(data, model_device)
         
-        # A. DEDICATED LOOP FOR BASE_MODULES (conv1, fc)
         if hasattr(self.gptq_model, 'base_modules') and self.gptq_model.base_modules:
             log.info(f"Processing {len(self.gptq_model.base_modules)} base modules first...")
             for module_name in self.gptq_model.base_modules:
@@ -137,11 +135,13 @@ class ModuleLooper():
 
                 inputs_cache = []
                 data_device = model_device if calibration_enable_gpu_cache else CPU
+                
+                # THIS IS THE CORRECTED LINE
                 def store_input_hook(_, args, kwargs):
                     inputs_cache.append(args[0].to(data_device, non_blocking=True))
                     raise ValueError("Input captured for base module")
 
-                handle = module.register_forward_pre_hook(store_input_hook)
+                handle = module.register_forward_pre_hook(store_input_hook, with_kwargs=True)
                 for data in calibration_data:
                     try: self.gptq_model.model(**data)
                     except ValueError: pass
@@ -159,7 +159,6 @@ class ModuleLooper():
 
                 if auto_gc: torch_empty_cache()
 
-        # B. ORIGINAL LOGIC FOR MAIN BLOCKS (layer1, layer2, etc.)
         if hasattr(self.gptq_model, "get_layers") and self.gptq_model.get_layers is not None:
             layers_with_names = self.gptq_model.get_layers(self.gptq_model.model)
             layers = [module for _, module in layers_with_names]
