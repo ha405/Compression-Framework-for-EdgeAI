@@ -123,20 +123,33 @@ class ModuleLooper():
         for i, data in enumerate(calibration_data):
             calibration_data[i] = nested_move_to(data, model_device)
         
-        if hasattr(self.gptq_model, 'base_modules') and self.gptq_model.base_modules:
-            log.info(f"Processing {len(self.gptq_model.base_modules)} base modules first...")
-            for module_name in self.gptq_model.base_modules:
+        # Get all layers to be processed to set up the progress bar correctly
+        base_module_names = self.gptq_model.base_modules if hasattr(self.gptq_model, 'base_modules') else []
+        if hasattr(self.gptq_model, "get_layers") and self.gptq_model.get_layers is not None:
+            layers_with_names = self.gptq_model.get_layers(self.gptq_model.model)
+            layers = [module for _, module in layers_with_names]
+        else:
+            layers, layers_prefix = get_module_by_name_prefix(self.gptq_model.model, self.gptq_model.layers_node)
+            layers_with_names = [(f"{layers_prefix}.{i}", layer) for i, layer in enumerate(layers)]
+        
+        total_steps = len(base_module_names) + len(layers_with_names)
+        quant_modules_pb = (log.pb(total_steps).manual().set(left_steps_offset=1))
+        for processor in self.processors:
+            processor.pb = quant_modules_pb
+
+        # A. DEDICATED LOOP FOR BASE_MODULES (conv1, fc)
+        if base_module_names:
+            log.info(f"Processing {len(base_module_names)} base modules first...")
+            for module_name in base_module_names:
+                quant_modules_pb.title(f"Quantizing base module: {module_name}").draw()
                 module = get_module(self.gptq_model.model, module_name)
                 if not module:
                     log.warning(f"Could not find base module: {module_name}")
+                    quant_modules_pb.next()
                     continue
                 
-                log.info(f"Quantizing base module: {module_name}")
-
                 inputs_cache = []
                 data_device = model_device if calibration_enable_gpu_cache else CPU
-                
-                # THIS IS THE CORRECTED LINE
                 def store_input_hook(_, args, kwargs):
                     inputs_cache.append(args[0].to(data_device, non_blocking=True))
                     raise ValueError("Input captured for base module")
@@ -156,16 +169,11 @@ class ModuleLooper():
                         if not processor.is_skipped(named_module):
                             processor.process(named_module)
                             processor.submodule_finalize(named_module)
-
+                
+                quant_modules_pb.next()
                 if auto_gc: torch_empty_cache()
 
-        if hasattr(self.gptq_model, "get_layers") and self.gptq_model.get_layers is not None:
-            layers_with_names = self.gptq_model.get_layers(self.gptq_model.model)
-            layers = [module for _, module in layers_with_names]
-        else:
-            layers, layers_prefix = get_module_by_name_prefix(self.gptq_model.model, self.gptq_model.layers_node)
-            layers_with_names = [(f"{layers_prefix}.{i}", layer) for i, layer in enumerate(layers)]
-
+        # B. ORIGINAL LOGIC FOR MAIN BLOCKS (layer1, layer2, etc.)
         for p_index, processor in enumerate(self.processors):
             if not processor.verify_calibration_dataset(p_index):
                 if isinstance(processor, GPTQProcessor):
@@ -185,12 +193,8 @@ class ModuleLooper():
         if not self.gptq_model.quantize_config.true_sequential:
             layer_modules = [sum(layer_modules, [])]
         
-        layer_count = len(layers)
-        quant_modules_pb = (log.pb(layer_count).manual().set(left_steps_offset=1))
-
         for processor in self.processors:
-            processor.layer_count = layer_count
-            processor.pb = quant_modules_pb
+            processor.layer_count = len(layers_with_names)
 
         if self.gptq_model.layers_modules_tree:
             replace_module_with_hooked_tree(self.gptq_model.model, self.gptq_model.layers_modules_tree, debug=False)
@@ -199,7 +203,6 @@ class ModuleLooper():
 
         log.info(f"Processing {len(layers_with_names)} main layer blocks...")
         for layer_index, (layer_name, module) in enumerate(layers_with_names):
-            quant_modules_pb.next()
             quant_modules_pb.title(f"Quantizing block {layer_name}").draw()
             
             self.gptq_model.pre_quantize(module)
@@ -260,6 +263,7 @@ class ModuleLooper():
                             reverse_p.submodule_finalize(processed_subset[name])
                     del module
 
+            quant_modules_pb.next()
             if auto_gc: torch_empty_cache()
 
         for reverse_p in reversed(self.processors):
