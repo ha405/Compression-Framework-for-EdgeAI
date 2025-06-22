@@ -421,32 +421,31 @@ class PackableQuantLinear(BaseQuantLinear):
 
     def pack(
         self,
-        module: nn.Module,
+        linear: nn.Module,
         scales: t.Tensor,
         zeros: t.Tensor,
-        g_idx: t.Tensor = None
+        g_idx: t.Tensor = None,
     ):
         """
-        Quantize & bit-pack module.weight into self.qweight/self.qzeros.
+        Quantize & bit-pack `linear.weight` into self.qweight/self.qzeros.
         Supports:
           - torch._ConvNd (Conv1d/2d/3d): flattens weight to [out, in_total]
           - transformers.pytorch_utils.Conv1D: transposes weight to [out, in]
-          - nn.Linear: uses weight as-is [out, in]
+          - nn.Linear
         """
-
-        # 1) Grab raw weight and flatten for convs
-        W = module.weight.data.clone().float()
-        if isinstance(module, _ConvNd):
+        # 1) Grab and flatten weight
+        W = linear.weight.data.clone().float()
+        if isinstance(linear, _ConvNd):
             out_c, in_c, *kernel = W.shape
             in_total = in_c * math.prod(kernel)
             W = W.flatten(1)                   # → [out_c, in_total]
-        elif isinstance(module, transformers.pytorch_utils.Conv1D):
-            W = W.T                            # HF Conv1D is stored [in, out]
+        elif isinstance(linear, transformers.pytorch_utils.Conv1D):
+            W = W.T                            # HF Conv1D stored [in, out]
             out_c, in_total = W.shape
         else:
             out_c, in_total = W.shape         # nn.Linear
 
-        # 2) Build per-element group index
+        # 2) Build full-length group index
         if g_idx is None:
             base = t.arange(self.in_features, device=W.device) // self.group_size
         else:
@@ -454,7 +453,7 @@ class PackableQuantLinear(BaseQuantLinear):
         repeats = in_total // base.numel()
         g_idx_full = base.repeat_interleave(repeats)
 
-        # 3) Ensure scales & zeros are in [groups, out_c] shape
+        # 3) Normalize scales/zeros to [groups, out_c]
         num_groups = math.ceil(self.in_features / self.group_size)
         if scales.shape == (num_groups, out_c):
             s_go, z_go = scales, zeros
@@ -462,28 +461,27 @@ class PackableQuantLinear(BaseQuantLinear):
             # maybe passed in as [out_c, groups]
             s_go, z_go = scales.T.contiguous(), zeros.T.contiguous()
 
-        # 4) Expand metadata to per-input index
-        #    → [in_total, out_c]
-        exp_s = s_go[g_idx_full, :]
-        exp_z = z_go[g_idx_full, :]
+        # 4) Expand to per-input
+        exp_s = s_go[g_idx_full, :]    # [in_total, out_c]
+        exp_z = z_go[g_idx_full, :]    # [in_total, out_c]
 
-        # 5) Compute integerized weights
-        #    W is [out_c, in_total], so we transpose metadata
+        # 5) Integerize
+        # W is [out_c, in_total], so transpose metadata
         W_int = t.round((W + exp_z.T) / exp_s.T).to(t.int32)
 
-        # 6) Store float16 metadata for inference
+        # 6) Store float16 metadata for forward
         self.scales = s_go.to(t.float16)
-        if hasattr(module, "bias") and module.bias is not None:
-            self.bias = module.bias.clone().to(t.float16)
+        if getattr(linear, "bias", None) is not None:
+            self.bias = linear.bias.clone().to(t.float16)
 
-        # 7) Pad to align with pack_factor
+        # 7) Pad to pack_factor
         pad = (-in_total) % self.pack_factor
         if pad > 0:
             extra = t.zeros(out_c, pad, dtype=W_int.dtype, device=W_int.device)
             W_int = t.cat([W_int, extra], dim=1)
             in_total += pad
 
-        # 8) Bit-pack qweight into shape [in_total//pack_factor, out_c]
+        # 8) Bit-pack qweight → [in_total//pack_factor, out_c]
         int_np = W_int.T.cpu().numpy().astype(self.pack_np_math_dtype)  # [in_total, out_c]
         rows = in_total // self.pack_factor
         qw = np.zeros((rows, out_c), dtype=self.pack_np_math_dtype)
@@ -493,8 +491,8 @@ class PackableQuantLinear(BaseQuantLinear):
                 qw[r] |= (block[b] & self.maxq) << (self.bits * b)
         self.qweight = t.from_numpy(qw.astype(self.pack_np_dtype)).to(self.scales.device)
 
-        # 9) Bit-pack qzeros into shape [num_groups, out_c//pack_factor]
-        z_np = z_go.cpu().numpy().astype(self.pack_np_math_dtype)     # [groups, out_c]
+        # 9) Bit-pack qzeros → [num_groups, out_c//pack_factor]
+        z_np = z_go.cpu().numpy().astype(self.pack_np_math_dtype)        # [groups, out_c]
         cols = out_c // self.pack_factor
         qz = np.zeros((num_groups, cols), dtype=self.pack_np_math_dtype)
         for g in range(num_groups):
@@ -505,3 +503,4 @@ class PackableQuantLinear(BaseQuantLinear):
                     acc |= int(z_np[g, base_idx + b] & self.maxq) << (self.bits * b)
                 qz[g, c] = acc
         self.qzeros = t.from_numpy(qz.astype(self.pack_np_dtype)).to(self.scales.device)
+
