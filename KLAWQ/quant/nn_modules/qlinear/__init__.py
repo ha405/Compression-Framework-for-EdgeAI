@@ -419,99 +419,89 @@ class PackableQuantLinear(BaseQuantLinear):
         return self.scales[self.g_idx.long()] * (weight - zeros[self.g_idx.long()])
 
 
-    def pack(self,
-             linear: nn.Module,
-             scales: t.Tensor,
-             zeros: t.Tensor,
-             g_idx: t.Tensor = None):
+    def pack(
+        self,
+        module: nn.Module,
+        scales: torch.Tensor,
+        zeros: torch.Tensor,
+        g_idx: torch.Tensor = None
+    ):
         """
-        Quantize & bit-pack `linear.weight` into self.qweight/self.qzeros.
-        Handles nn.Linear, HF Conv1D, and torch._ConvNd by flattening.
+        Quantize & bit-pack module.weight into self.qweight/self.qzeros.
+        Supports:
+          - torch._ConvNd (Conv1d/2d/3d): flattens weight to [out, in_total]
+          - transformers.pytorch_utils.Conv1D: transposes weight to [out, in]
+          - nn.Linear: uses weight as-is [out, in]
         """
-        # 1) Extract weight as [out, in_total]
-        W = linear.weight.data.clone()
-        if isinstance(linear, _ConvNd):
-            W = W.flatten(1)
-        elif isinstance(linear, transformers.pytorch_utils.Conv1D):
-            W = W.T
-        out_features, in_total = W.shape
 
-        # 2) Build full-length group index
-        base_gidx = (g_idx.clone() if g_idx is not None else self.g_idx).long()
-        kernel_elems = in_total // base_gidx.shape[0]
-        g_idx_full = base_gidx.repeat_interleave(kernel_elems) if kernel_elems > 1 else base_gidx
-
-        # 3) Normalize scales/zeros to [out, num_groups]
-        num_groups = math.ceil(self.in_features / self.group_size)
-        if scales.shape == (num_groups, out_features):
-            # coming in [groups, out] → transpose to [out, groups]
-            scales_og = scales.T.contiguous()
-            zeros_og  = zeros.T.contiguous()
+        # 1) Grab raw weight and flatten for convs
+        W = module.weight.data.clone().float()
+        if isinstance(module, _ConvNd):
+            out_c, in_c, *kernel = W.shape
+            in_total = in_c * math.prod(kernel)
+            W = W.flatten(1)                   # → [out_c, in_total]
+        elif isinstance(module, transformers.pytorch_utils.Conv1D):
+            W = W.T                            # HF Conv1D is stored [in, out]
+            out_c, in_total = W.shape
         else:
-            # coming in [out, groups]
-            scales_og = scales.contiguous()
-            zeros_og  = zeros.contiguous()
+            out_c, in_total = W.shape         # nn.Linear
 
-        # 4) Expand to [out, in_total]
-        exp_s = scales_og[:, g_idx_full]
-        exp_z = zeros_og[:,  g_idx_full]
+        # 2) Build per-element group index
+        if g_idx is None:
+            base = torch.arange(self.in_features, device=W.device) // self.group_size
+        else:
+            base = g_idx.clone().long()
+        repeats = in_total // base.numel()
+        g_idx_full = base.repeat_interleave(repeats)
 
-        # 5) Quantize to int32
-        intW = t.round((W / exp_s) + exp_z).to(t.int32)
+        # 3) Ensure scales & zeros are in [groups, out_c] shape
+        num_groups = math.ceil(self.in_features / self.group_size)
+        if scales.shape == (num_groups, out_c):
+            s_go, z_go = scales, zeros
+        else:
+            # maybe passed in as [out_c, groups]
+            s_go, z_go = scales.T.contiguous(), zeros.T.contiguous()
 
-        # 6) Store float16 metadata—**fixed shape** [groups, out]
-        # scales_og is [out, groups], so transpose back
-        self.scales = scales_og.T.clone().to(t.float16)
-        if linear.bias is not None:
-            self.bias = linear.bias.clone().to(t.float16)
+        # 4) Expand metadata to per-input index
+        #    → [in_total, out_c]
+        exp_s = s_go[g_idx_full, :]
+        exp_z = z_go[g_idx_full, :]
 
-        # 7) Pad in_total to multiple of pack_factor
+        # 5) Compute integerized weights
+        #    W is [out_c, in_total], so we transpose metadata
+        W_int = torch.round((W + exp_z.T) / exp_s.T).to(torch.int32)
+
+        # 6) Store float16 metadata for inference
+        self.scales = s_go.to(torch.float16)
+        if hasattr(module, "bias") and module.bias is not None:
+            self.bias = module.bias.clone().to(torch.float16)
+
+        # 7) Pad to align with pack_factor
         pad = (-in_total) % self.pack_factor
-        if pad:
-            intW = t.cat([intW, intW.new_zeros(out_features, pad)], dim=1)
+        if pad > 0:
+            extra = torch.zeros(out_c, pad, dtype=W_int.dtype, device=W_int.device)
+            W_int = torch.cat([W_int, extra], dim=1)
             in_total += pad
 
-        # 8) Move weight to NumPy [in_padded, out]
-        int_np = intW.T.cpu().numpy().astype(self.pack_np_math_dtype)
-        num_rows = in_total // self.pack_factor
+        # 8) Bit-pack qweight into shape [in_total//pack_factor, out_c]
+        int_np = W_int.T.cpu().numpy().astype(self.pack_np_math_dtype)  # [in_total, out_c]
+        rows = in_total // self.pack_factor
+        qw = np.zeros((rows, out_c), dtype=self.pack_np_math_dtype)
+        for r in range(rows):
+            block = int_np[r*self.pack_factor:(r+1)*self.pack_factor, :]
+            for b in range(self.pack_factor):
+                qw[r] |= (block[b] & self.maxq) << (self.bits * b)
+        self.qweight = torch.from_numpy(qw.astype(self.pack_np_dtype)).to(self.scales.device)
 
-        # 9) Bit‑pack weights
-        qw = np.zeros((num_rows, out_features), dtype=self.pack_np_math_dtype)
-        if self.bits in [2, 4, 8]:
-            for r in range(num_rows):
-                for j in range(self.pack_factor):
-                    qw[r] |= int_np[r*self.pack_factor + j] << (self.bits * j)
-        else:  # 3‑bit special
-            i = row = 0
-            while row < num_rows:
-                for j in range(i, i+10):
-                    qw[row] |= int_np[j] << (3*(j-i))
-                i += 10; qw[row] |= int_np[i] << 30; row += 1
-                qw[row] |= (int_np[i] >> 2) & 1; i += 1
-                for j in range(i, i+10):
-                    qw[row] |= int_np[j] << (3*(j-i)+1)
-                i += 10; qw[row] |= int_np[i] << 31; row += 1
-                qw[row] |= (int_np[i] >> 1) & 0x3; i += 1
-                for j in range(i, i+10):
-                    qw[row] |= int_np[j] << (3*(j-i)+2)
-                i += 10; row += 1
-
-        self.qweight = t.from_numpy(qw.astype(self.pack_np_dtype))
-
-        # 10) Bit‑pack zeros into [groups, out//pack_factor]
-        if zeros.shape == (num_groups, out_features):
-            zeros_np = zeros.cpu().numpy()
-        else:
-            zeros_np = zeros.T.cpu().numpy()
-        zeros_np = zeros_np.astype(self.pack_np_math_dtype)
-
-        qz = np.zeros((num_groups, out_features // self.pack_factor),
-                      dtype=self.pack_np_math_dtype)
+        # 9) Bit-pack qzeros into shape [num_groups, out_c//pack_factor]
+        z_np = z_go.cpu().numpy().astype(self.pack_np_math_dtype)     # [groups, out_c]
+        cols = out_c // self.pack_factor
+        qz = np.zeros((num_groups, cols), dtype=self.pack_np_math_dtype)
         for g in range(num_groups):
-            for col in range(out_features // self.pack_factor):
-                base = col * self.pack_factor
-                for k in range(self.pack_factor):
-                    qz[g, col] |= zeros_np[g, base + k] << (self.bits * k)
-
-        self.qzeros = t.from_numpy(qz.astype(self.pack_np_dtype))
-
+            for c in range(cols):
+                base_idx = c * self.pack_factor
+                acc = 0
+                for b in range(self.pack_factor):
+                    acc |= int(z_np[g, base_idx + b] & self.maxq) << (self.bits * b)
+                qz[g, c] = acc
+        self.qzeros = torch.from_numpy(qz.astype(self.pack_np_dtype)).to(self.scales.device)
