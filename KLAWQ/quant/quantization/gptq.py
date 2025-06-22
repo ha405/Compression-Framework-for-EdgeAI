@@ -89,7 +89,7 @@ class GPTQ:
 
         self.device = self.module.weight.device
         self.compute_device = DEVICE_1 if DEVICE_1.type != 'cpu' else CPU
-        log.info(f"GPTQ layer {self.name} on {self.device}, compute on {self.compute_device}")
+        # log.info(f"GPTQ layer {self.name} on {self.device}, compute on {self.compute_device}")
 
         self.W_orig = self._clone_module_weight(self.compute_device)
         expected_shape = (self.rows, self.columns)
@@ -174,6 +174,7 @@ class GPTQ:
 
     def add_batch(self, inp: torch.Tensor, out: Optional[torch.Tensor]=None):
         self.fwd_counter += 1
+        print(f"[DEBUG] add_batch called for {self.name}, input shape: {inp.shape}")
         buffer_device = CPU if DEVICE_0.index == DEVICE_1.index else DEVICE_1
         if self.fwd_inputs_buffered:
             self.fwd_inputs_buffered_data.append(inp.to(device=buffer_device, non_blocking=True))
@@ -209,6 +210,7 @@ class GPTQ:
         alpha_scale = 2.0 / total_samples
 
         if self.H is None: self.H = torch.zeros((self.columns, self.columns), dtype=torch.float32, device=self.compute_device)
+        print(f"[DEBUG] {self.name} reshaped input stats: mean={reshaped_inp.mean():.6f}, std={reshaped_inp.std():.6f}, min={reshaped_inp.min():.6f}, max={reshaped_inp.max():.6f}")
         self.H.addmm_(reshaped_inp.T, reshaped_inp, beta=beta_scale, alpha=alpha_scale)
 
         if self.qcfg.beta > 0:
@@ -289,13 +291,13 @@ class GPTQ:
                 self.process_batch(inp_batch.to(device=self.compute_device))
             self.fwd_inputs_buffered_data.clear()
             if self.compute_device.type == 'cuda': torch.cuda.synchronize()
-            log.info(f"Finished processing buffered inputs for {self.name}.")
+            # log.info(f"Finished processing buffered inputs for {self.name}.")
 
         if self.nsamples == 0: raise ValueError(f"No samples collected {self.name}")
         if self.H is None: raise RuntimeError(f"Hessian is None {self.name}")
         H_tot = self.H
         if self.qcfg.beta > 0 and self.A is not None:
-            log.debug(f"Adding KL Hessian with beta={self.qcfg.beta}")
+            # log.debug(f"Adding KL Hessian with beta={self.qcfg.beta}")
             H_tot = H_tot + self.qcfg.beta * self.A
         if self.qcfg.gamma > 0 and hasattr(self, 'B') and self.B is not None:
             log.debug(f"Adding CE Hessian with gamma={self.qcfg.gamma}")
@@ -303,7 +305,7 @@ class GPTQ:
         del self.H; self.H = None
         if hasattr(self, 'A'): del self.A; self.A = None
         if hasattr(self, 'B'): del self.B; self.B = None
-
+        print(f"[DEBUG] {self.name} original weights (W_orig) stats: mean={self.W_orig.mean():.6f}, std={self.W_orig.std():.6f}, min={self.W_orig.min():.6f}, max={self.W_orig.max():.6f}")
         W = self.W_orig.clone()
         del self.W_orig; self.W_orig = None
 
@@ -316,7 +318,7 @@ class GPTQ:
 
         scale = []; zero = []; now_idx = 1; groups = []
         if self.qcfg.static_groups and self.qcfg.group_size != -1:
-            log.debug(f"Using static groups (size={self.qcfg.group_size}) for {self.name}")
+            # log.debug(f"Using static groups (size={self.qcfg.group_size}) for {self.name}")
             group_size = self.qcfg.group_size
             for i in range(0, self.columns, group_size):
                 quantizer_group = copy.deepcopy(self.quantizer)
@@ -327,7 +329,7 @@ class GPTQ:
 
         perm, invperm = None, None
         if self.qcfg.desc_act:
-            log.debug(f"Applying activation order (desc_act=True) for {self.name}")
+            # log.debug(f"Applying activation order (desc_act=True) for {self.name}")
             diag_H = torch.diag(H).clone(); perm = torch.argsort(diag_H, descending=True)
             del diag_H; W = W[:, perm]; H = H[perm][:, perm]; invperm = torch.argsort(perm)
 
@@ -410,11 +412,12 @@ class GPTQ:
              zero = self.quantizer.zero.to(device=self.compute_device)
 
         duration = time.time() - start
-        log.info(f"Finished quantization for {self.name} in {duration:.2f} seconds. Final damp: {damp:.5f}")
+        # log.info(f"Finished quantization for {self.name} in {duration:.2f} seconds. Final damp: {damp:.5f}")
+        print(f"[DEBUG] {self.name} final quantized weights stats: mean={Q.mean():.6f}, std={Q.std():.6f}, min={Q.min():.6f}, max={Q.max():.6f}")
         return Q, scale, zero, g_idx, duration, avg_loss, damp, self.nsamples
 
     def free(self):
-        log.debug(f"Freeing resources for GPTQ layer {self.name}")
+        # log.debug(f"Freeing resources for GPTQ layer {self.name}")
         for attr in ["H", "A", "W_orig", "quantizer", "module", "W_ref", "fwd_inputs_buffered_data", "module_copy"]:
             if hasattr(self, attr): delattr(self, attr)
         if 'fwd_inputs_buffered_data' not in locals() and hasattr(self, 'fwd_inputs_buffered_data'): self.fwd_inputs_buffered_data.clear()
