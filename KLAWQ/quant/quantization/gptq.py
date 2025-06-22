@@ -17,27 +17,22 @@ except ImportError:
     class Conv1D(nn.Module): pass
 
 from torch.nn.modules.conv import _ConvNd
-
-# Assuming these relative imports work from where gptq.py is located
 from ..looper.named_module import NamedModule
 from ..quantization import QuantizeConfig
 from ..utils.logger import setup_logger
 from ..utils.torch import auto_select_torch_device, torch_compile, torch_sync
 
-# Ensure Quantizer and HF_OPTIMUM are correctly imported
 try:
     from .quantizer import HF_OPTIMUM, Quantizer
 except ImportError:
     try: from quantizer import HF_OPTIMUM, Quantizer
-    except ImportError: HF_OPTIMUM="hf_optimum"; Quantizer=None # Placeholder
+    except ImportError: HF_OPTIMUM="hf_optimum"; Quantizer=None
 
 log = setup_logger()
-
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 CPU = torch.device("cpu")
-# Use a robust way to get devices, handling cases where CUDA might not be available
 try:
     if torch.cuda.is_available():
         DEVICE_0 = auto_select_torch_device(index=0)
@@ -57,13 +52,10 @@ def get_number_of_rows_and_cols(layer: nn.Module):
         layer = layer.module
 
     if isinstance(layer, (nn.Linear, Conv1D)):
-        # For Linear, it's (out_features, in_features)
-        # For Conv1D, it's (out_features, in_features) after transpose
         rows = layer.weight.shape[0]
         cols = layer.weight.shape[1]
         return rows, cols
-    elif isinstance(layer, _ConvNd): # This handles Conv1d, Conv2d, etc.
-        # For Conv, treat it as Linear(out_channels, in_channels * kernel_size)
+    elif isinstance(layer, _ConvNd):
         rows = layer.weight.shape[0]
         cols = int(torch.prod(torch.tensor(layer.weight.shape[1:])))
         return rows, cols
@@ -77,19 +69,17 @@ def get_number_of_rows_and_cols(layer: nn.Module):
 
 class GPTQ:
     def __init__(self, module: nn.Module, qcfg: Optional[QuantizeConfig]=None):
-        # MODIFIED: Use the NamedModule directly to get the original module instance
         if isinstance(module, NamedModule):
             self.named_module = module
-            self.module = module.instance
+            self.module = module.module
             self.name = module.full_name
         else:
             self.named_module = None
             self.module = module
             self.name = HF_OPTIMUM
 
-        self.W_ref = self.module.weight # Reference to original module's weight tensor
+        self.W_ref = self.module.weight
         self.rows, self.columns = get_number_of_rows_and_cols(self.module)
-        
         self._validate_module(self.module)
 
         self.qcfg = qcfg if qcfg else QuantizeConfig()
@@ -103,7 +93,6 @@ class GPTQ:
         self.compute_device = DEVICE_1 if DEVICE_1.type != 'cpu' else CPU
         log.info(f"GPTQ layer {self.name} on {self.device}, compute on {self.compute_device}")
 
-        # MODIFIED: W_orig is always 2D
         self.W_orig = self._clone_module_weight(self.compute_device)
         expected_shape = (self.rows, self.columns)
         if self.W_orig.shape != expected_shape:
@@ -137,14 +126,12 @@ class GPTQ:
         if source_weight.device == target_device: clone = source_weight.clone()
         else: clone = source_weight.to(device=target_device, copy=True)
         
-        # Reshape to 2D for GPTQ algorithm
         if isinstance(self.module, _ConvNd): 
             clone = clone.flatten(1)
         elif isinstance(self.module, Conv1D): 
             clone = clone.t()
         return clone.float()
 
-    # block_cholesky_inverse remains unchanged
     @torch.inference_mode()
     def block_cholesky_inverse(self, L: torch.Tensor, upper=False, block_size=512):
         n = L.size(0); device = L.device; dtype = L.dtype
@@ -192,19 +179,16 @@ class GPTQ:
         else:
             self.process_batch(inp)
 
-    # MODIFIED: This is the most critical change.
     def process_batch(self, inp: torch.Tensor):
         inp_compute = inp.to(device=self.compute_device, dtype=torch.float32)
         original_shape = inp_compute.shape
         
-        # Reshape input to be compatible with the 2D weight matrix
         if isinstance(self.module, (nn.Linear, Conv1D)):
             if inp_compute.ndim > 2:
                 reshaped_inp = inp_compute.reshape(-1, original_shape[-1])
             else:
                 reshaped_inp = inp_compute
         elif isinstance(self.module, nn.Conv2d):
-            # Use F.unfold to extract image patches and align with Conv2d weights
             unfolded_inp = F.unfold(
                 inp_compute,
                 kernel_size=self.module.kernel_size,
@@ -212,7 +196,6 @@ class GPTQ:
                 padding=self.module.padding,
                 stride=self.module.stride
             )
-            # Reshape to (batch_size * num_patches, in_channels * k_h * k_w)
             reshaped_inp = unfolded_inp.permute(0, 2, 1).reshape(-1, unfolded_inp.shape[1])
         else:
             raise TypeError(f"Unsupported layer type for process_batch: {type(self.module)}")
@@ -225,15 +208,13 @@ class GPTQ:
 
         total_samples = self.nsamples + batch_token_size
         beta_scale = float(self.nsamples) / total_samples
-        alpha_scale = 2.0 / total_samples # The 2 is from the GPTQ paper
+        alpha_scale = 2.0 / total_samples
 
         if self.H is None:
             self.H = torch.zeros((self.columns, self.columns), dtype=torch.float32, device=self.compute_device)
         
-        # Hessian calculation: H = H * beta + (inp.T @ inp) * alpha
         self.H.addmm_(reshaped_inp.T, reshaped_inp, beta=beta_scale, alpha=alpha_scale)
 
-        # The rest of the KL/CE logic is fine as it operates on the 2D reshaped input
         if self.qcfg.beta > 0:
             if self.A is None: self.A = torch.zeros((self.columns, self.columns), dtype=torch.float32, device=self.compute_device)
             output = reshaped_inp @ self.W_orig.T
@@ -250,7 +231,6 @@ class GPTQ:
         
         self.nsamples += batch_token_size
 
-    # hf_quantize remains unchanged
     def hf_quantize(self, blocksize=128, percdamp=0.01, damp_auto_increment=0.0015, group_size=-1, actorder=False, static_groups=False):
         self.qcfg.group_size = group_size; self.qcfg.damp_percent = percdamp; self.qcfg.damp_auto_increment = damp_auto_increment;
         self.qcfg.desc_act = actorder; self.qcfg.static_groups = static_groups;
@@ -258,7 +238,6 @@ class GPTQ:
         self.module.weight.data = Q.to(self.device, dtype=self.W_ref.dtype)
         return scale, zero, g_idx, duration, avg_loss, damp_percent
 
-    # hessian_inverse remains unchanged
     @torch.inference_mode()
     def hessian_inverse(self, H: torch.Tensor) -> Tuple[torch.Tensor, float]:
         damp = self.qcfg.damp_percent; max_damp = 1.0 - 1e-6
@@ -370,12 +349,6 @@ class GPTQ:
 
         if self.qcfg.desc_act:
             Q = Q[:, invperm]; g_idx = g_idx[invperm.to(CPU)]
-
-        # MODIFIED: Reshape the 2D quantized weight Q back to its original shape
-        if Q.shape != self.W_ref.shape:
-             Q = Q.reshape(self.W_ref.shape)
-
-        Q = Q.to(dtype=self.W_ref.dtype, device=self.compute_device)
 
         if not scale: scale.append(self.quantizer.scale); zero.append(self.quantizer.zero)
         scale = torch.cat(scale, dim=1).to(device=self.compute_device)
