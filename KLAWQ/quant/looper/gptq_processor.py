@@ -53,8 +53,8 @@ class GPTQProcessor(LoopProcessor):
         if self.qcfg.dynamic_get(layer_name=module.full_name) == False:
             return
 
-        if not isinstance(module.instance, (torch.nn.Linear, torch.nn.Conv2d)):
-            log.info(f"Skipping module {module.full_name} of type {type(module.instance)} as it is not a Linear or Conv2d layer.")
+        if not isinstance(module.module, (torch.nn.Linear, torch.nn.Conv2d)):
+            log.info(f"Skipping module {module.full_name} of type {type(module.module)} as it is not a Linear or Conv2d layer.")
             return
 
         qcfg_clone = copy.deepcopy(self.qcfg)
@@ -108,12 +108,10 @@ class GPTQProcessor(LoopProcessor):
 
         stats_0 = torch.cuda.memory_stats(DEVICE_0)
         active_0 = stats_0.get("active_bytes.all.current", 0) / 1024 ** 2
-        peak_active_0 = stats_0.get("active_bytes.all.peak", 0) / 1024 ** 2
-
+        
         if torch.cuda.device_count() > 1:
             stats_1 = torch.cuda.memory_stats(DEVICE_1)
             active_1 = stats_1.get("active_bytes.all.current", 0) / 1024 ** 2
-            peak_active_1 = stats_1.get("active_bytes.all.peak", 0) / 1024 ** 2
             max_memory = f"{active_0:.2f}MB, {active_1:.2f}MB"
         else:
             max_memory = f"{active_0:.2f}MB"
@@ -143,26 +141,24 @@ class GPTQProcessor(LoopProcessor):
         })
 
         if self.retain_w:
-            w = module.weight.data
+            w = module.module.weight.data
             module.state.update({"w": w})
 
         self.tasks[module.name].free()
 
-        if hasattr(module, 'original_shape'):
-            wq = wq_2d.reshape(module.original_shape)
-        else:
-            wq = wq_2d
+        original_shape = module.module.weight.shape
+        wq = wq_2d.reshape(original_shape)
 
         wq = wq.to(device=DEVICE_0)
         module.state.update({"wq": wq})
-        module.weight.data = wq
+        module.module.weight.data = wq
 
         if auto_gc:
             torch_empty_cache()
 
     def submodule_finalize(self, module: NamedModule):
         if "wq" in module.state:
-            module.weight.data = move_to(module.state.pop("wq"), device=CPU, stream=self.stream)
+            module.module.weight.data = move_to(module.state.pop("wq"), device=CPU, stream=self.stream)
             module.state.pop("w", None)
 
     def finalize(self, model: BaseGPTQModel, **kwargs):
