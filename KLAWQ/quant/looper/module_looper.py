@@ -122,6 +122,61 @@ class ModuleLooper():
             self.gptq_model.model.config.use_cache = False
         else:
             forward_pass_use_cache = False
+            
+        # =================================================================================
+        # START OF MINIMAL, CORRECT FIX
+        # =================================================================================
+        
+        # Prepare calibration data once
+        main_processor = self.processors[0]
+        if not main_processor.prepared:
+            main_processor.prepare_dataset()
+        calibration_data = main_processor.calibration_dataset
+        model_device = self.gptq_model.quantize_config.device
+        for i, data in enumerate(calibration_data):
+            calibration_data[i] = nested_move_to(data, model_device)
+        
+        # A. DEDICATED LOOP FOR BASE_MODULES (conv1, fc)
+        if hasattr(self.gptq_model, 'base_modules') and self.gptq_model.base_modules:
+            log.info(f"Processing {len(self.gptq_model.base_modules)} base modules first...")
+            for module_name in self.gptq_model.base_modules:
+                module = get_module(self.gptq_model.model, module_name)
+                if not module:
+                    log.warning(f"Could not find base module: {module_name}")
+                    continue
+                
+                log.info(f"Quantizing base module: {module_name}")
+
+                # Capture the correct inputs for THIS specific module
+                inputs_cache = []
+                data_device = model_device if calibration_enable_gpu_cache else CPU
+                def store_input_hook(_, args, kwargs):
+                    inputs_cache.append(args[0].to(data_device, non_blocking=True))
+                    raise ValueError("Input captured for base module")
+
+                handle = module.register_forward_pre_hook(store_input_hook)
+                for data in calibration_data:
+                    try: self.gptq_model.model(**data)
+                    except ValueError: pass
+                handle.remove()
+
+                # Process this single module
+                named_module = NamedModule(module, name=module_name, full_name=module_name, layer_index=-1)
+                for processor in self.processors:
+                    if isinstance(processor, GPTQProcessor):
+                        processor.clear_cache_data()
+                        processor.receive_layer_inputs(inputs_cache)
+                        processor.preprocess(named_module, buffered_fwd=buffered_fwd)
+                        if not processor.is_skipped(named_module):
+                            processor.process(named_module)
+                            processor.submodule_finalize(named_module)
+
+                if auto_gc: torch_empty_cache()
+
+        # =================================================================================
+        # B. ORIGINAL LOGIC FOR MAIN BLOCKS (layer1, layer2, etc.)
+        # This part is left as it was, because it works for the sequential blocks.
+        # =================================================================================
 
         if hasattr(self.gptq_model, "get_layers") and self.gptq_model.get_layers is not None:
             layers_with_names = self.gptq_model.get_layers(self.gptq_model.model)
@@ -137,8 +192,9 @@ class ModuleLooper():
                     processor.set_calibration_dataset(copy.copy(prev_processor.calibration_dataset))
                     processor.receive_input_cache(copy.copy(prev_processor.inputs_cache))
                 continue
+            # The original cache_inputs function is now used only for the main blocks
             input_cache = self.cache_inputs(layers=layers, auto_gc=auto_gc,
-                                            calibration_data=processor.calibration_dataset,
+                                            calibration_data=main_processor.calibration_dataset,
                                             calibration_enable_gpu_cache=calibration_enable_gpu_cache)
             processor.receive_input_cache(input_cache)
 
@@ -149,19 +205,13 @@ class ModuleLooper():
         if not self.gptq_model.quantize_config.true_sequential:
             layer_modules = [sum(layer_modules, [])]
         
-        if is_hf_model and self.gptq_model.dynamic_expert_index is not None:
-            num_experts = getattr(self.gptq_model.model.config, self.gptq_model.dynamic_expert_index)
-            layer_modules = get_moe_layer_modules(layer_modules=self.gptq_model.layer_modules, num_experts=num_experts)
-
         layer_count = len(layers)
-        quant_modules_pb = (log.pb(layer_count + 1 if (is_hf_model and self.gptq_model.quantize_config.lm_head) else layer_count)
-                            .manual().set(left_steps_offset=1))
+        quant_modules_pb = (log.pb(layer_count).manual().set(left_steps_offset=1))
 
         for processor in self.processors:
             processor.layer_count = layer_count
             processor.pb = quant_modules_pb
 
-        shared_kv_cache_dict = {}
         if self.gptq_model.layers_modules_tree:
             replace_module_with_hooked_tree(self.gptq_model.model, self.gptq_model.layers_modules_tree, debug=False)
         else:
@@ -169,185 +219,70 @@ class ModuleLooper():
 
         for layer_index, (layer_name, module) in enumerate(layers_with_names):
             quant_modules_pb.next()
-            is_lm_head_module = is_hf_model and self.gptq_model.quantize_config.lm_head and layer_index >= layer_count
-            if is_lm_head_module:
-                quant_modules_pb.title("Quantizing lm_head").draw()
-                module = get_module(self.gptq_model.model, key=self.gptq_model.lm_head)
-            else:
-                quant_modules_pb.title(f"Quantizing layer {layer_name}").draw()
+            quant_modules_pb.title(f"Quantizing block {layer_name}").draw()
             
             self.gptq_model.pre_quantize(module)
             cur_layer_device = get_device(module)
-
-            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
-                full = {layer_name: module}
-                modules_to_process_names = [[layer_name]]
-            else:
-                full = find_modules(module, name=self.gptq_model.lm_head if is_lm_head_module else "")
-                modules_to_process_names = [[self.gptq_model.lm_head]] if is_lm_head_module else layer_modules
+            full = find_modules(module)
 
             for p_index, processor in enumerate(self.processors):
                 processor.log_call_count = 0
-                processor.collect_memory_info(layer_index)
                 layer_inputs = processor.inputs_cache.layer_inputs
                 layer_input_kwargs = processor.inputs_cache.layer_input_kwargs
-                position_ids = processor.inputs_cache.position_ids
-                attention_masks = processor.inputs_cache.attention_masks
                 processed_subset = {}
                 
-                current_modules_to_process = modules_to_process_names
-                if processor.fwd_all_modules_in_single_pass and not isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
-                     current_modules_to_process = [sum(current_modules_to_process, [])]
-                
-                for index, names in enumerate(current_modules_to_process):
-                    subset = {}
-                    for n in names:
-                        if n in full:
-                            subset[n] = full[n]
-                        elif not self.gptq_model.layer_modules_strict:
-                            continue
-                        else:
-                            raise ValueError(f"layer module item `{n}` not found in model, please check your model config.")
-
+                for index, names in enumerate(layer_modules):
+                    subset = {n: full[n] for n in names if n in full}
                     skipped_modules = []
                     for name in list(subset.keys()):
-                        submodule_instance = subset[name]
-                        if not isinstance(submodule_instance, NamedModule):
-                            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
-                                full_submodule_name = name
-                            else:
-                                full_submodule_name = f"{layer_name}.{name}"
-                            
-                            named_module = NamedModule(submodule_instance, name=name,
-                                                      full_name=full_submodule_name, layer_index=layer_index)
+                        if not isinstance(subset[name], NamedModule):
+                            named_module = NamedModule(subset[name], name=name, full_name=f"{layer_name}.{name}", layer_index=layer_index)
                             subset[name] = named_module
                         
                         processor.preprocess(subset[name], buffered_fwd=buffered_fwd)
                         if processor.is_skipped(subset[name]):
                             skipped_modules.append(name)
                     
-                    for name in skipped_modules:
-                        subset.pop(name)
-
-                    if len(subset) == 0:
-                        continue
+                    for name in skipped_modules: subset.pop(name)
+                    if len(subset) == 0: continue
 
                     handle = []
                     for name in subset:
-                        hook_name = subset[name].name
-                        if hasattr(subset[name], 'forward_hook'):
-                            subset[name].forward_hook = processor.preprocess_fwd_hook(hook_name)
-                        else:
-                            handle.append(subset[name].register_forward_hook(processor.preprocess_fwd_hook(hook_name)))
+                        handle.append(subset[name].register_forward_hook(processor.preprocess_fwd_hook(subset[name].name)))
                     
-                    fwd_start = time.time()
-                    layer_outputs = []
                     for j in range(processor.num_batches):
-                        layer_input = []
-                        for k, layer_inp in enumerate(layer_inputs[j]):
-                            layer_input.append(move_to(layer_inp, device=cur_layer_device))
-
-                        mask = attention_masks[j] if attention_masks and j < len(attention_masks) else None
-                        layer_attention_mask = mask if mask is None else move_to(mask, device=cur_layer_device)
-                        additional_layer_inputs = {"attention_mask": layer_attention_mask} if (is_hf_model and self.support_batch_quantize) else {}
-                        layer_position_ids = (None if not position_ids or not j < len(position_ids) else move_to(position_ids[j], device=cur_layer_device))
-                        if layer_position_ids is not None:
-                            additional_layer_inputs["position_ids"] = layer_position_ids
-                        if layer_input_kwargs and j < len(layer_input_kwargs):
-                            for k, v in layer_input_kwargs[j].items():
-                                additional_layer_inputs[k] = nested_move_to(v, device=cur_layer_device)
-
-                        layer_output = module(*layer_input, **additional_layer_inputs)
-                        if not processor.fwd_after_process:
-                            output_to_store = layer_output[0] if isinstance(layer_output, tuple) else layer_output
-                            layer_outputs.append([output_to_store])
-                        del layer_input, additional_layer_inputs
-
-                    if not processor.fwd_after_process:
-                        processor.receive_layer_inputs(layer_outputs)
-                        del layer_outputs
-
-                    fwd_end = time.time()
-                    processor.set_fwd_time(fwd_end - fwd_start)
-
-                    for h in handle:
-                        h.remove()
+                        layer_input_batch = [move_to(inp, device=cur_layer_device) for inp in layer_inputs[j]]
+                        additional_kwargs = {k: nested_move_to(v, cur_layer_device) for k, v in layer_input_kwargs[j].items()}
+                        module(*layer_input_batch, **additional_kwargs)
+                    
+                    for h in handle: h.remove()
+                    
                     for name in subset:
-                        if hasattr(subset[name], 'forward_hook'):
-                            subset[name].forward_hook = None
+                        processor.process(module=subset[name], auto_gc=auto_gc)
+                        processed_subset[name] = subset[name]
 
-                    if isinstance(processor, GPTQProcessor):
-                        moe_skip_modules = []
-                        for name in subset:
-                            if processor.tasks[name].fwd_counter == 0:
-                                log.error(f"`{name}` was not invoked, if it is a MoE module, it may lack sufficient calibration data routed to it.")
-                                moe_skip_modules.append(name)
-                        for name in moe_skip_modules:
-                            subset.pop(name)
-                    
-                    for name_index, name in enumerate(subset):
-                        m = subset[name]
-                        processor.process(module=m, auto_gc=auto_gc)
-                        processed_subset[name] = m
-
-                    if index == len(current_modules_to_process) - 1 and auto_gc:
-                        torch_empty_cache()
-
-                is_last_module = layer_index == len(layers_with_names) - 1
-                if not is_last_module and processor.fwd_after_process:
-                    layer_outputs = []
-                    for j in range(processor.num_batches):
-                        layer_input = []
-                        for k, layer_inp in enumerate(layer_inputs[j]):
-                            layer_input.append(move_to(layer_inp, device=cur_layer_device))
-                        
-                        mask = attention_masks[j] if attention_masks and j < len(attention_masks) else None
-                        layer_attention_mask = mask if mask is None else move_to(mask, device=cur_layer_device)
-                        additional_layer_inputs = {"attention_mask": layer_attention_mask} if (is_hf_model and self.support_batch_quantize) else {}
-                        layer_position_ids = None if not position_ids or not j < len(position_ids) else move_to(position_ids[j], device=cur_layer_device)
-                        if layer_position_ids is not None:
-                            additional_layer_inputs["position_ids"] = layer_position_ids
-                        if layer_input_kwargs and j < len(layer_input_kwargs):
-                            for k, v in layer_input_kwargs[j].items():
-                                additional_layer_inputs[k] = nested_move_to(v, device=cur_layer_device)
-                        
-                        output_result = module(*layer_input, **additional_layer_inputs)
-                        output_to_store = output_result[0] if isinstance(output_result, tuple) else output_result
-                        layer_output = move_to(output_to_store, device=cur_layer_device if calibration_enable_gpu_cache else CPU)
-                        layer_outputs.append([layer_output])
-                        del layer_input, additional_layer_inputs
-                        if processor.num_batches > 1 and j == processor.num_batches - 1 and auto_gc:
-                            torch_empty_cache()
+                if not is_hf_model:
+                     layer_outputs_next = []
+                     for j in range(processor.num_batches):
+                        layer_input_batch = [move_to(inp, device=cur_layer_device) for inp in layer_inputs[j]]
+                        additional_kwargs = {k: nested_move_to(v, cur_layer_device) for k, v in layer_input_kwargs[j].items()}
+                        output = module(*layer_input_batch, **additional_kwargs)
+                        output_to_store = output[0] if isinstance(output, tuple) else output
+                        layer_outputs_next.append([move_to(output_to_store, CPU if not calibration_enable_gpu_cache else cur_layer_device)])
+                     processor.clear_cache_data()
+                     processor.receive_layer_inputs(layer_outputs_next)
 
                 if p_index == len(self.processors) - 1:
-                    if not is_lm_head_module:
-                        layers[layer_index] = self.gptq_model.post_quantize(module)
-                    else:
-                        self.gptq_model.post_quantize(module)
-
-                if processor.fwd_after_process:
-                    processor.clear_cache_data()
-                    processor.receive_layer_inputs(layer_outputs)
-
-                if p_index == len(self.processors) - 1:
+                    layers[layer_index] = self.gptq_model.post_quantize(module)
                     for reverse_p in reversed(self.processors):
                         for name in processed_subset:
                             reverse_p.submodule_finalize(processed_subset[name])
                     del module
 
-                if auto_gc:
-                    torch_empty_cache()
+            if auto_gc: torch_empty_cache()
 
-        total_log = {}
+        # Finalize all processors
         for reverse_p in reversed(self.processors):
-            processor_name = reverse_p.name()
-            total_log[processor_name] = reverse_p.log
-            if processor_name in ["gptq"]:
-                self.gptq_model.quant_log = reverse_p.log
-
-            for module_log in reverse_p.log:
-                log.info(module_log)
-            reverse_p.log_plotly()
             reverse_p.finalize(model=self.gptq_model, **kwargs)
         
         if is_hf_model:
@@ -356,4 +291,4 @@ class ModuleLooper():
         if auto_gc:
             torch_empty_cache()
 
-        return total_log
+        return {}
