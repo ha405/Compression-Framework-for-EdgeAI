@@ -62,19 +62,16 @@ class ModuleLooper():
 
         layers[0] = layers[0].to(self.gptq_model.quantize_config.device)
         ori_outside_layer_module_devices = {}
-        # MODIFIED: Add a check for base_modules existence before iterating
         if hasattr(self.gptq_model, 'base_modules') and self.gptq_model.base_modules:
             for module_name in self.gptq_model.base_modules:
                 module, _ = get_module_by_name_prefix(self.gptq_model.model, [module_name])
-
                 if module is None:
                     continue
-
                 ori_outside_layer_module_devices[module_name] = get_device(module)
                 if module is not None:
                     move_to(module, cur_layer_device)
         handle = layers[0].register_forward_pre_hook(store_input_hook, with_kwargs=True)
-        is_ovis = self.gptq_model.__class__.__name__ == "OvisGPTQ"
+        
         self.gptq_model.pre_quantize_generate_hook_start()
         for example in calibration_data:
             for k, v in example.items():
@@ -108,16 +105,12 @@ class ModuleLooper():
                 tied_keys = self.gptq_model.model._tied_weights_keys
                 for item in tied_keys:
                     if self.gptq_model.lm_head in item:
-                        raise NotImplementedError("quantization of `lm_head` layer with `tied_weights=True` model state is not supported. Please check model has `tied_weights=False`.")
-
+                        raise NotImplementedError("quantization of `lm_head` layer with `tied_weights=True` model state is not supported.")
             lm_head_module = get_module(self.gptq_model.model, key=self.gptq_model.lm_head)
             if get_module(self.gptq_model.model, key=self.gptq_model.lm_head) is None:
                 raise ValueError(f"could not find layer {self.gptq_model.lm_head} in the model, exit...")
-
             if not isinstance(lm_head_module, tuple(SUPPORTS_MODULE_TYPES)):
-                raise NotImplementedError(f"This type({type(lm_head_module)}) of lm_head quantization is currently not "
-                                          f"supported. SUPPORTS_MODULE_TYPES is {SUPPORTS_MODULE_TYPES}")
-
+                raise NotImplementedError(f"This type({type(lm_head_module)}) of lm_head quantization is currently not supported.")
             lm_head_quant_config = {"bits": 8, "group_size": 32, "sym": True, "desc_act": False, "mse": 2.4}
             if self.gptq_model.quantize_config.dynamic is None:
                 self.gptq_model.quantize_config.dynamic = {self.gptq_model.lm_head: lm_head_quant_config}
@@ -130,13 +123,10 @@ class ModuleLooper():
         else:
             forward_pass_use_cache = False
 
-        # MODIFIED: This block now handles both HF and generic models correctly.
         if hasattr(self.gptq_model, "get_layers") and self.gptq_model.get_layers is not None:
-            # New path for ResNet: get_layers returns a list of (name, module) tuples
             layers_with_names = self.gptq_model.get_layers(self.gptq_model.model)
             layers = [module for _, module in layers_with_names]
         else:
-            # Legacy path for standard HF models
             layers, layers_prefix = get_module_by_name_prefix(self.gptq_model.model, self.gptq_model.layers_node)
             layers_with_names = [(f"{layers_prefix}.{i}", layer) for i, layer in enumerate(layers)]
 
@@ -147,7 +137,6 @@ class ModuleLooper():
                     processor.set_calibration_dataset(copy.copy(prev_processor.calibration_dataset))
                     processor.receive_input_cache(copy.copy(prev_processor.inputs_cache))
                 continue
-
             input_cache = self.cache_inputs(layers=layers, auto_gc=auto_gc,
                                             calibration_data=processor.calibration_dataset,
                                             calibration_enable_gpu_cache=calibration_enable_gpu_cache)
@@ -157,69 +146,60 @@ class ModuleLooper():
             processor.release_calibration_dataset()
 
         layer_modules = self.gptq_model.layer_modules
-
         if not self.gptq_model.quantize_config.true_sequential:
             layer_modules = [sum(layer_modules, [])]
         
         if is_hf_model and self.gptq_model.dynamic_expert_index is not None:
             num_experts = getattr(self.gptq_model.model.config, self.gptq_model.dynamic_expert_index)
-            layer_modules = get_moe_layer_modules(layer_modules=self.gptq_model.layer_modules,
-                                                  num_experts=num_experts)
+            layer_modules = get_moe_layer_modules(layer_modules=self.gptq_model.layer_modules, num_experts=num_experts)
 
         layer_count = len(layers)
         quant_modules_pb = (log.pb(layer_count + 1 if (is_hf_model and self.gptq_model.quantize_config.lm_head) else layer_count)
-                            .manual()
-                            .set(left_steps_offset=1))
+                            .manual().set(left_steps_offset=1))
 
         for processor in self.processors:
             processor.layer_count = layer_count
             processor.pb = quant_modules_pb
 
         shared_kv_cache_dict = {}
-
         if self.gptq_model.layers_modules_tree:
             replace_module_with_hooked_tree(self.gptq_model.model, self.gptq_model.layers_modules_tree, debug=False)
         else:
             replace_module_with_hooked_legacy(self.gptq_model.model)
 
-        # MODIFIED: The main loop now iterates over the named layers.
         for layer_index, (layer_name, module) in enumerate(layers_with_names):
             quant_modules_pb.next()
-
             is_lm_head_module = is_hf_model and self.gptq_model.quantize_config.lm_head and layer_index >= layer_count
-
             if is_lm_head_module:
                 quant_modules_pb.title("Quantizing lm_head").draw()
                 module = get_module(self.gptq_model.model, key=self.gptq_model.lm_head)
-                layer_inputs = self.gptq_model.lm_head_pre_quantize_generate_hook(layer_inputs)
             else:
                 quant_modules_pb.title(f"Quantizing layer {layer_name}").draw()
-                
-            if module.__class__.__name__.lower() == "mllamacrossattentiondecoderlayer":
-                continue
-
+            
             self.gptq_model.pre_quantize(module)
-
             cur_layer_device = get_device(module)
-            full = find_modules(module, name=self.gptq_model.lm_head if is_lm_head_module else "")
+
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+                full = {layer_name: module}
+                modules_to_process_names = [[layer_name]]
+            else:
+                full = find_modules(module, name=self.gptq_model.lm_head if is_lm_head_module else "")
+                modules_to_process_names = [[self.gptq_model.lm_head]] if is_lm_head_module else layer_modules
 
             for p_index, processor in enumerate(self.processors):
                 processor.log_call_count = 0
                 processor.collect_memory_info(layer_index)
-
                 layer_inputs = processor.inputs_cache.layer_inputs
                 layer_input_kwargs = processor.inputs_cache.layer_input_kwargs
                 position_ids = processor.inputs_cache.position_ids
                 attention_masks = processor.inputs_cache.attention_masks
-
                 processed_subset = {}
-
-                modules_to_process = [[self.gptq_model.lm_head]] if is_lm_head_module else layer_modules
-
-                if processor.fwd_all_modules_in_single_pass:
-                    modules_to_process = [sum(modules_to_process, [])]
-
-                for index, names in enumerate(modules_to_process):
+                
+                current_modules_to_process = modules_to_process_names
+                if processor.fwd_all_modules_in_single_pass and not isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+                     current_modules_to_process = [sum(current_modules_to_process, [])]
+                
+                for index, names in enumerate(current_modules_to_process):
                     subset = {}
                     for n in names:
                         if n in full:
@@ -230,21 +210,22 @@ class ModuleLooper():
                             raise ValueError(f"layer module item `{n}` not found in model, please check your model config.")
 
                     skipped_modules = []
-
                     for name in subset:
-                        # MODIFIED: This is the critical fix for name consistency.
-                        submodule_full_name = self.gptq_model.lm_head if is_lm_head_module else f"{layer_name}.{name}"
-
-                        if not isinstance(subset[name], NamedModule):
-                            named_module = NamedModule(subset[name], name=name, full_name=submodule_full_name,
-                                                      layer_index=layer_index)
+                        submodule_instance = subset[name]
+                        if not isinstance(submodule_instance, NamedModule):
+                            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+                                full_submodule_name = name
+                            else:
+                                full_submodule_name = f"{layer_name}.{name}"
+                            short_name_for_hook = name.split('.')[-1]
+                            named_module = NamedModule(instance=submodule_instance, name=short_name_for_hook,
+                                                      full_name=full_submodule_name, layer_index=layer_index)
                             subset[name] = named_module
-                            full[name] = named_module
-
+                        
                         processor.preprocess(subset[name], buffered_fwd=buffered_fwd)
                         if processor.is_skipped(subset[name]):
                             skipped_modules.append(name)
-
+                    
                     for name in skipped_modules:
                         subset.pop(name)
 
@@ -253,12 +234,12 @@ class ModuleLooper():
 
                     handle = []
                     for name in subset:
+                        hook_name = subset[name].name
                         if hasattr(subset[name], 'forward_hook'):
-                            subset[name].forward_hook = processor.preprocess_fwd_hook(name)
+                            subset[name].forward_hook = processor.preprocess_fwd_hook(hook_name)
                         else:
-                            assert (f"forward_hook missing for module name: `{name}`, layer name: {submodule_full_name}")
-                            handle.append(subset[name].register_forward_hook(processor.preprocess_fwd_hook(name)))
-
+                            handle.append(subset[name].register_forward_hook(processor.preprocess_fwd_hook(hook_name)))
+                    
                     fwd_start = time.time()
                     layer_outputs = []
                     for j in range(processor.num_batches):
@@ -268,40 +249,26 @@ class ModuleLooper():
 
                         mask = attention_masks[j] if attention_masks and j < len(attention_masks) else None
                         layer_attention_mask = mask if mask is None else move_to(mask, device=cur_layer_device)
-
                         additional_layer_inputs = {"attention_mask": layer_attention_mask} if (is_hf_model and self.support_batch_quantize) else {}
-                        layer_position_ids = (
-                            None if not position_ids or not j < len(position_ids) else move_to(position_ids[j], device=cur_layer_device)
-                        )
+                        layer_position_ids = (None if not position_ids or not j < len(position_ids) else move_to(position_ids[j], device=cur_layer_device))
                         if layer_position_ids is not None:
                             additional_layer_inputs["position_ids"] = layer_position_ids
                         if layer_input_kwargs and j < len(layer_input_kwargs):
                             for k, v in layer_input_kwargs[j].items():
                                 additional_layer_inputs[k] = nested_move_to(v, device=cur_layer_device)
 
-                        if is_hf_model and hasattr(module, "reuse_kv"):
-                            if module.reuse_kv:
-                                additional_layer_inputs["kv_last_layer"] = shared_kv_cache_dict.get(layer_index - 1)
-                            layer_output = module(*layer_input) if is_lm_head_module else module(*layer_input, **additional_layer_inputs)
-                            if shared_kv_cache_dict.get(layer_index) is None:
-                                shared_kv_cache_dict[layer_index] = layer_output[-1]
-                        else:
-                            layer_output = module(*layer_input, **additional_layer_inputs)
-
+                        layer_output = module(*layer_input, **additional_layer_inputs)
                         if not processor.fwd_after_process:
                             output_to_store = layer_output[0] if isinstance(layer_output, tuple) else layer_output
                             layer_outputs.append([output_to_store])
-
-                        del layer_input
-                        del additional_layer_inputs
+                        del layer_input, additional_layer_inputs
 
                     if not processor.fwd_after_process:
                         processor.receive_layer_inputs(layer_outputs)
                         del layer_outputs
 
                     fwd_end = time.time()
-                    fwd_time = fwd_end - fwd_start
-                    processor.set_fwd_time(fwd_time)
+                    processor.set_fwd_time(fwd_end - fwd_start)
 
                     for h in handle:
                         h.remove()
@@ -323,9 +290,8 @@ class ModuleLooper():
                         processor.process(module=m, auto_gc=auto_gc)
                         processed_subset[name] = m
 
-                    if index == len(modules_to_process) - 1:
-                        if auto_gc:
-                            torch_empty_cache()
+                    if index == len(current_modules_to_process) - 1 and auto_gc:
+                        torch_empty_cache()
 
                 is_last_module = layer_index == len(layers_with_names) - 1
                 if not is_last_module and processor.fwd_after_process:
@@ -344,21 +310,12 @@ class ModuleLooper():
                         if layer_input_kwargs and j < len(layer_input_kwargs):
                             for k, v in layer_input_kwargs[j].items():
                                 additional_layer_inputs[k] = nested_move_to(v, device=cur_layer_device)
-
-                        if is_hf_model and hasattr(module, "reuse_kv"):
-                            if module.reuse_kv:
-                                additional_layer_inputs["kv_last_layer"] = shared_kv_cache_dict.get(layer_index - 1)
                         
-                        output_result = module(*layer_input) if is_lm_head_module else module(*layer_input, **additional_layer_inputs)
+                        output_result = module(*layer_input, **additional_layer_inputs)
                         output_to_store = output_result[0] if isinstance(output_result, tuple) else output_result
-                        layer_output = move_to(
-                            output_to_store,
-                            device=cur_layer_device if calibration_enable_gpu_cache else CPU,
-                        )
+                        layer_output = move_to(output_to_store, device=cur_layer_device if calibration_enable_gpu_cache else CPU)
                         layer_outputs.append([layer_output])
-
-                        del layer_input
-                        del additional_layer_inputs
+                        del layer_input, additional_layer_inputs
                         if processor.num_batches > 1 and j == processor.num_batches - 1 and auto_gc:
                             torch_empty_cache()
 

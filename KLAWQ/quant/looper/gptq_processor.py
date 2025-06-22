@@ -53,29 +53,29 @@ class GPTQProcessor(LoopProcessor):
         if self.qcfg.dynamic_get(layer_name=module.full_name) == False:
             return
 
+        if not isinstance(module.instance, (torch.nn.Linear, torch.nn.Conv2d)):
+            log.info(f"Skipping module {module.full_name} of type {type(module.instance)} as it is not a Linear or Conv2d layer.")
+            return
+
         qcfg_clone = copy.deepcopy(self.qcfg)
 
         if self.qcfg.dynamic is not None:
             qcfg_clone.bits = self.qcfg.dynamic_get(module.full_name, "bits", qcfg_clone.bits)
             qcfg_clone.sym = self.qcfg.dynamic_get(module.full_name, "sym", qcfg_clone.sym)
             qcfg_clone.mse = self.qcfg.dynamic_get(module.full_name, "mse", qcfg_clone.mse)
-
             qcfg_clone.group_size = self.qcfg.dynamic_get(module.full_name, "group_size", qcfg_clone.group_size)
             qcfg_clone.desc_act = self.qcfg.dynamic_get(module.full_name, "desc_act", qcfg_clone.desc_act)
             qcfg_clone.damp_percent = self.qcfg.dynamic_get(module.full_name, "damp_percent", qcfg_clone.damp_percent)
             qcfg_clone.static_groups = self.qcfg.dynamic_get(module.full_name, "static_groups", qcfg_clone.static_groups)
 
         self.qcfg_dynamic = qcfg_clone
-
         tmp = GPTQ(module=module, qcfg=qcfg_clone)
 
         if buffered_fwd:
             log.info(f"Experimental: enabling fwd buffered mode for: `{module.name}`")
             tmp.fwd_inputs_buffered = True
 
-        tmp.quantizer.configure(
-            perchannel=True,
-        )
+        tmp.quantizer.configure(perchannel=True)
         self.tasks[module.name] = tmp
 
     def is_skipped(self, module: NamedModule) -> bool:
@@ -87,8 +87,9 @@ class GPTQProcessor(LoopProcessor):
 
     def preprocess_fwd_hook(self, name: str) -> Callable[[Module, Tuple[torch.Tensor, ...], torch.Tensor], None]:
         def tmp(_, inp: Tuple[torch.Tensor, ...], out: torch.Tensor):
-            g = self.tasks[name]
-            g.add_batch(inp[0].data, out.data)
+            g = self.tasks.get(name)
+            if g:
+                g.add_batch(inp[0].data, out.data)
             del inp, out
         return tmp
 
@@ -99,7 +100,7 @@ class GPTQProcessor(LoopProcessor):
         self.pb.title(f"Quantizing {module.name} in layer ").draw()
 
         g = self.tasks[module.name]
-        wq, scale, zero, g_idx, duration, avg_loss, damp_percent, nsamples = g.quantize()
+        wq_2d, scale, zero, g_idx, duration, avg_loss, damp_percent, nsamples = g.quantize()
 
         self.durations.append(duration)
         self.avg_losses.append(avg_loss)
@@ -113,7 +114,6 @@ class GPTQProcessor(LoopProcessor):
             stats_1 = torch.cuda.memory_stats(DEVICE_1)
             active_1 = stats_1.get("active_bytes.all.current", 0) / 1024 ** 2
             peak_active_1 = stats_1.get("active_bytes.all.peak", 0) / 1024 ** 2
-
             max_memory = f"{active_0:.2f}MB, {active_1:.2f}MB"
         else:
             max_memory = f"{active_0:.2f}MB"
@@ -134,7 +134,6 @@ class GPTQProcessor(LoopProcessor):
             stat["dynamic"] = self.qcfg.dynamic_get(layer_name=module.full_name)
 
         self.log.append(stat)
-
         self.log_new_row(stat)
 
         self.result_save(module.full_name, {
@@ -145,26 +144,26 @@ class GPTQProcessor(LoopProcessor):
 
         if self.retain_w:
             w = module.weight.data
-            module.state.update({
-                "w": w,
-            })
+            module.state.update({"w": w})
 
         self.tasks[module.name].free()
 
+        if hasattr(module, 'original_shape'):
+            wq = wq_2d.reshape(module.original_shape)
+        else:
+            wq = wq_2d
+
         wq = wq.to(device=DEVICE_0)
-
-        module.state.update({
-            "wq": wq,
-        })
-
+        module.state.update({"wq": wq})
         module.weight.data = wq
 
         if auto_gc:
             torch_empty_cache()
 
     def submodule_finalize(self, module: NamedModule):
-        module.weight.data = move_to(module.state.pop("wq"), device=CPU, stream=self.stream)
-        module.state.pop("w", None)
+        if "wq" in module.state:
+            module.weight.data = move_to(module.state.pop("wq"), device=CPU, stream=self.stream)
+            module.state.pop("w", None)
 
     def finalize(self, model: BaseGPTQModel, **kwargs):
         if self.stream:
@@ -185,11 +184,8 @@ class GPTQProcessor(LoopProcessor):
             parallel_packing=self.qcfg.parallel_packing,
             pack_dtype=self.qcfg.pack_dtype,
         )
-
         model.quantized = True
-
         model.quantize_config.quant_method = QUANT_METHOD.GPTQ
-
         super().finalize(model=model, **kwargs)
 
     def verify_calibration_dataset(self, processor_index: int) -> bool:
