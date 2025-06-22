@@ -17,22 +17,27 @@ except ImportError:
     class Conv1D(nn.Module): pass
 
 from torch.nn.modules.conv import _ConvNd
+
+# Assuming these relative imports work from where gptq.py is located
 from ..looper.named_module import NamedModule
 from ..quantization import QuantizeConfig
 from ..utils.logger import setup_logger
 from ..utils.torch import auto_select_torch_device, torch_compile, torch_sync
 
+# Ensure Quantizer and HF_OPTIMUM are correctly imported
 try:
     from .quantizer import HF_OPTIMUM, Quantizer
 except ImportError:
     try: from quantizer import HF_OPTIMUM, Quantizer
-    except ImportError: HF_OPTIMUM="hf_optimum"; Quantizer=None
+    except ImportError: HF_OPTIMUM="hf_optimum"; Quantizer=None # Placeholder
 
 log = setup_logger()
+
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 CPU = torch.device("cpu")
+# Use a robust way to get devices, handling cases where CUDA might not be available
 try:
     if torch.cuda.is_available():
         DEVICE_0 = auto_select_torch_device(index=0)
@@ -50,36 +55,29 @@ lock = threading.Lock()
 def get_number_of_rows_and_cols(layer: nn.Module):
     if isinstance(layer, NamedModule):
         layer = layer.module
-
+        
+    # MODIFIED: Use _ConvNd for generic convolution handling
     if isinstance(layer, (nn.Linear, Conv1D)):
-        rows = layer.weight.shape[0]
-        cols = layer.weight.shape[1]
-        return rows, cols
-    elif isinstance(layer, _ConvNd):
-        rows = layer.weight.shape[0]
-        cols = int(torch.prod(torch.tensor(layer.weight.shape[1:])))
-        return rows, cols
+        return layer.weight.shape[1], layer.weight.shape[0] if isinstance(layer, Conv1D) else layer.weight.shape[0]
+    elif isinstance(layer, _ConvNd): # This handles Conv1d, Conv2d, etc.
+        return layer.weight.shape[0], int(torch.prod(torch.tensor(layer.weight.shape[1:])))
     else:
         if hasattr(layer, 'weight') and isinstance(layer.weight, torch.Tensor) and layer.weight.ndim >= 2:
              log.warning(f"Attempting fallback shape calculation for layer type: {type(layer)}")
-             rows = layer.weight.shape[0]
-             cols = int(torch.prod(torch.tensor(layer.weight.shape[1:])))
-             return rows, cols
+             return layer.weight.shape[0], int(torch.prod(torch.tensor(layer.weight.shape[1:])))
         raise TypeError(f"Unsupported layer type for get_number_of_rows_and_cols: {type(layer)}")
 
 class GPTQ:
     def __init__(self, module: nn.Module, qcfg: Optional[QuantizeConfig]=None):
+        self.W_ref = module.weight
+        self.rows, self.columns = get_number_of_rows_and_cols(module)
         if isinstance(module, NamedModule):
-            self.named_module = module
             self.module = module.module
-            self.name = module.full_name
+            self.name = module.name
         else:
-            self.named_module = None
-            self.module = module
             self.name = HF_OPTIMUM
+            self.module = module
 
-        self.W_ref = self.module.weight
-        self.rows, self.columns = get_number_of_rows_and_cols(self.module)
         self._validate_module(self.module)
 
         self.qcfg = qcfg if qcfg else QuantizeConfig()
@@ -112,6 +110,7 @@ class GPTQ:
 
     @staticmethod
     def _validate_module(module):
+        # MODIFIED: Use _ConvNd for generic convolution handling
         supported_types = (nn.Linear, _ConvNd, Conv1D)
         if not isinstance(module, supported_types):
              if not (hasattr(module, 'weight') and isinstance(module.weight, torch.Tensor)):
@@ -122,13 +121,14 @@ class GPTQ:
         return Quantizer(qcfg=self.qcfg, name=name)
 
     def _clone_module_weight(self, target_device: torch.device) -> torch.Tensor:
-        source_weight = self.module.weight.data
+        source_module = self.module
+        source_weight = source_module.weight.data
         if source_weight.device == target_device: clone = source_weight.clone()
         else: clone = source_weight.to(device=target_device, copy=True)
-        
-        if isinstance(self.module, _ConvNd): 
+        # MODIFIED: Use _ConvNd for generic convolution handling
+        if isinstance(source_module, _ConvNd): 
             clone = clone.flatten(1)
-        elif isinstance(self.module, Conv1D): 
+        elif isinstance(source_module, Conv1D): 
             clone = clone.t()
         return clone.float()
 
@@ -162,6 +162,7 @@ class GPTQ:
                 for invL_ik_part in invL_ik_blocks:
                      end_col_idx_Ljk = min(start_col_idx_Ljk + invL_ik_part.shape[1], k_end)
                      L_jk_part = L[j_start:j_end, start_col_idx_Ljk:end_col_idx_Ljk]
+                     # Simple error check for matmul compatibility
                      if invL_ik_part.shape[0] != L_jk_part.shape[1]:
                           raise RuntimeError(f"Shape mismatch in block Cholesky matmul: invL_ik_part.t() ({invL_ik_part.shape[1]}x{invL_ik_part.shape[0]}) @ L_jk_part.t() ({L_jk_part.shape[1]}x{L_jk_part.shape[0]})")
                      temp_col_parts_matmul.append(invL_ik_part.t() @ L_jk_part.t())
@@ -181,54 +182,65 @@ class GPTQ:
 
     def process_batch(self, inp: torch.Tensor):
         inp_compute = inp.to(device=self.compute_device, dtype=torch.float32)
-        original_shape = inp_compute.shape
-        
-        if isinstance(self.module, (nn.Linear, Conv1D)):
-            if inp_compute.ndim > 2:
-                reshaped_inp = inp_compute.reshape(-1, original_shape[-1])
-            else:
-                reshaped_inp = inp_compute
-        elif isinstance(self.module, nn.Conv2d):
-            unfolded_inp = F.unfold(
-                inp_compute,
-                kernel_size=self.module.kernel_size,
-                dilation=self.module.dilation,
-                padding=self.module.padding,
-                stride=self.module.stride
-            )
+
+        original_shape = inp_compute.shape; reshaped_inp = None; source_module = self.module
+        if isinstance(source_module, (nn.Linear, Conv1D)):
+            if inp_compute.ndim > 2: reshaped_inp = inp_compute.reshape(-1, original_shape[-1])
+            else: reshaped_inp = inp_compute
+        elif isinstance(source_module, nn.Conv2d): # This is specific, using _ConvNd would be too broad here
+            unfolded_inp = F.unfold(inp_compute, kernel_size=source_module.kernel_size, dilation=source_module.dilation, padding=source_module.padding, stride=source_module.stride)
             reshaped_inp = unfolded_inp.permute(0, 2, 1).reshape(-1, unfolded_inp.shape[1])
         else:
-            raise TypeError(f"Unsupported layer type for process_batch: {type(self.module)}")
+            if hasattr(source_module, 'weight') and inp_compute.ndim > 2:
+                  try: reshaped_inp = inp_compute.reshape(-1, self.columns)
+                  except Exception as reshape_err: raise TypeError(f"Unsupported layer {type(source_module)}, fallback failed: {reshape_err}")
+            else: raise TypeError(f"Unsupported layer type for process_batch: {type(source_module)}")
 
-        if reshaped_inp.shape[1] != self.columns:
-            raise ValueError(f"Shape mismatch in {self.name}: Input {original_shape} -> reshaped {reshaped_inp.shape}. Expected cols ({self.columns}) to match weight cols.")
+        if reshaped_inp is None or reshaped_inp.shape[1] != self.columns:
+            raise ValueError(f"Shape mismatch {self.name}: Input {original_shape} -> reshaped {reshaped_inp.shape if reshaped_inp is not None else 'None'}. Expected cols ({self.columns})")
 
         batch_token_size = reshaped_inp.shape[0]
         if batch_token_size == 0: return
 
         total_samples = self.nsamples + batch_token_size
+        if total_samples == 0: return
+
         beta_scale = float(self.nsamples) / total_samples
         alpha_scale = 2.0 / total_samples
 
-        if self.H is None:
-            self.H = torch.zeros((self.columns, self.columns), dtype=torch.float32, device=self.compute_device)
-        
+        if self.H is None: self.H = torch.zeros((self.columns, self.columns), dtype=torch.float32, device=self.compute_device)
         self.H.addmm_(reshaped_inp.T, reshaped_inp, beta=beta_scale, alpha=alpha_scale)
 
         if self.qcfg.beta > 0:
             if self.A is None: self.A = torch.zeros((self.columns, self.columns), dtype=torch.float32, device=self.compute_device)
             output = reshaped_inp @ self.W_orig.T
             if torch.isnan(output).any() or torch.isinf(output).any():
+                log.warning(f"NaN/Inf in pre-softmax output {self.name}. Clamping.")
                 output = torch.nan_to_num(output)
             tau = max(self.qcfg.tau, 1e-6)
             try:
                 pt = F.softmax(output / tau, dim=-1)
-                kl_weights = torch.sum(pt * (1.0 - pt), dim=-1).clamp(min=0.0)
+                if torch.isnan(pt).any(): raise ValueError("NaN detected in softmax output")
+                kl_weights = torch.sum(pt * (1.0 - pt), dim=-1)
+                kl_weights = torch.clamp(kl_weights, min=0.0)
             except ValueError:
+                log.warning(f"Could not compute valid softmax/KL weights {self.name}. Using zero weights.")
                 kl_weights = torch.zeros(batch_token_size, device=self.compute_device, dtype=torch.float32)
             weighted_inp = reshaped_inp * torch.sqrt(kl_weights).unsqueeze(1)
             self.A.addmm_(weighted_inp.T, weighted_inp, beta=beta_scale, alpha=alpha_scale)
         
+            if self.qcfg.gamma > 0:
+                if self.B is None:
+                    self.B = torch.zeros((self.columns, self.columns),
+                                        dtype=torch.float32, device=self.compute_device)
+                qt = F.softmax(output / tau, dim=-1)
+                ce_weights = torch.sum(qt * (1.0 - qt), dim=-1).clamp(min=0.0)
+                weighted_inp_ce = reshaped_inp * torch.sqrt(ce_weights).unsqueeze(1)
+                self.B.addmm_(weighted_inp_ce.T,
+                            weighted_inp_ce,
+                            beta=beta_scale,
+                            alpha=alpha_scale)
+
         self.nsamples += batch_token_size
 
     def hf_quantize(self, blocksize=128, percdamp=0.01, damp_auto_increment=0.0015, group_size=-1, actorder=False, static_groups=False):
@@ -283,21 +295,28 @@ class GPTQ:
         if self.H is None: raise RuntimeError(f"Hessian is None {self.name}")
         H_tot = self.H
         if self.qcfg.beta > 0 and self.A is not None:
+            log.debug(f"Adding KL Hessian with beta={self.qcfg.beta}")
             H_tot = H_tot + self.qcfg.beta * self.A
-        
+        if self.qcfg.gamma > 0 and hasattr(self, 'B') and self.B is not None:
+            log.debug(f"Adding CE Hessian with gamma={self.qcfg.gamma}")
+            H_tot = H_tot + self.qcfg.gamma * self.B
         del self.H; self.H = None
         if hasattr(self, 'A'): del self.A; self.A = None
-        
-        W = self.W_orig.clone(); del self.W_orig; self.W_orig = None
-        self.quantizer.find_params(W, weight=True)
-        H = H_tot.clone(); del H_tot
+        if hasattr(self, 'B'): del self.B; self.B = None
 
+        W = self.W_orig.clone()
+        del self.W_orig; self.W_orig = None
+
+        self.quantizer.find_params(W, weight=True)
+
+        H = H_tot.clone(); del H_tot
         dead = torch.diag(H) == 0
         H[dead, dead] = 1
         W[:, dead] = 0
 
         scale = []; zero = []; now_idx = 1; groups = []
         if self.qcfg.static_groups and self.qcfg.group_size != -1:
+            log.debug(f"Using static groups (size={self.qcfg.group_size}) for {self.name}")
             group_size = self.qcfg.group_size
             for i in range(0, self.columns, group_size):
                 quantizer_group = copy.deepcopy(self.quantizer)
@@ -308,59 +327,96 @@ class GPTQ:
 
         perm, invperm = None, None
         if self.qcfg.desc_act:
+            log.debug(f"Applying activation order (desc_act=True) for {self.name}")
             diag_H = torch.diag(H).clone(); perm = torch.argsort(diag_H, descending=True)
             del diag_H; W = W[:, perm]; H = H[perm][:, perm]; invperm = torch.argsort(perm)
 
         Hinv, damp = self.hessian_inverse(H); del H
+
         Losses = torch.zeros_like(W); Q = torch.zeros_like(W)
 
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns); count = i2 - i1
             W1 = W[:, i1:i2].clone(); Q1 = torch.zeros_like(W1); Err1 = torch.zeros_like(W1); Losses1 = torch.zeros_like(W1)
             Hinv1 = Hinv[i1:i2, i1:i2]
+
             for i in range(count):
                 w = W1[:, i]; d = Hinv1[i, i]
+
                 if self.qcfg.group_size != -1:
                     idx_global = i1 + i
                     group_idx = idx_global // self.qcfg.group_size
                     if self.qcfg.static_groups:
-                        current_quantizer = groups[group_idx] if group_idx < len(groups) else self.quantizer
+                        if group_idx < len(groups): current_quantizer = groups[group_idx]
+                        else: log.error(f"Static group index {group_idx} OOB! Using global."); current_quantizer = self.quantizer
                     else:
                         if idx_global % self.qcfg.group_size == 0:
-                            self.quantizer.find_params(W[:, idx_global:min(idx_global + self.qcfg.group_size, self.columns)], weight=True)
+                            start_g = idx_global; end_g = min(start_g + self.qcfg.group_size, self.columns)
+                            self.quantizer.find_params(W[:, start_g:end_g], weight=True)
                             if ((idx_global) // self.qcfg.group_size) - now_idx == -1:
                                 scale.append(self.quantizer.scale); zero.append(self.quantizer.zero); now_idx += 1
                         current_quantizer = self.quantizer
                 else: current_quantizer = self.quantizer
+
                 q = current_quantizer.quantize(w.unsqueeze(1)).flatten(); Q1[:, i] = q
                 Losses1[:, i] = (w - q) ** 2 / d**2
                 err1 = (w - q) / d
-                if i + 1 < count: W1[:, i+1:] -= err1.unsqueeze(1).matmul(Hinv1[i, i+1:].unsqueeze(0))
+                
+                if i + 1 < count:
+                    W1[:, i+1:] -= err1.unsqueeze(1).matmul(Hinv1[i, i+1:].unsqueeze(0))
                 Err1[:, i] = err1
-            Q[:, i1:i2] = Q1; Losses[:, i1:i2] = Losses1 / 2
-            if i2 < self.columns: W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
-        del Hinv, W1, Q1, Err1, Losses1; torch_sync()
-        avg_loss = torch.sum(Losses).item() / self.nsamples if self.nsamples != 0 else -1.0
+            Q[:, i1:i2] = Q1; Losses[:, i1:i2] = Losses1 / 2
+            if i2 < self.columns:
+                 W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+
+
+        del Hinv, W1, Q1, Err1, Losses1
+        torch_sync()
+
+        if self.nsamples != 0:
+            avg_loss = torch.sum(Losses).item() / self.nsamples
+            if math.isnan(avg_loss): avg_loss = float('inf'); log.error(f"Quantization NaN loss for {self.name}.")
+        else: avg_loss = -1.0; log.warning(f"Quantization {self.name} nsamples=0.")
         del Losses
 
         group_size_eff = self.qcfg.group_size if self.qcfg.group_size != -1 else self.columns
-        g_idx = torch.tensor([i // group_size_eff for i in range(self.columns)], dtype=torch.int32, device=CPU)
+        if group_size_eff <=0 : group_size_eff = self.columns
+        if self.qcfg.static_groups and self.qcfg.desc_act:
+             if perm is None: raise RuntimeError("perm is None for g_idx calculation")
+             g_idx_list = [perm[i].item() // group_size_eff for i in range(self.columns)]
+        else: g_idx_list = [i // group_size_eff for i in range(self.columns)]
+        g_idx = torch.tensor(g_idx_list, dtype=torch.int32, device=CPU)
 
         if self.qcfg.desc_act:
-            Q = Q[:, invperm]; g_idx = g_idx[invperm.to(CPU)]
+            if invperm is None: raise RuntimeError("invperm is None for unpermute")
+            Q = Q[:, invperm]
+            g_idx = g_idx[invperm.to(CPU)]
+
+        if isinstance(self.module, Conv1D): Q = Q.t()
+        if Q.shape != self.W_ref.shape:
+             Q = Q.reshape(self.W_ref.shape).to(dtype=self.W_ref.dtype)
+        else:
+             Q = Q.to(dtype=self.W_ref.dtype)
+        Q = Q.to(device=self.compute_device)
 
         if not scale: scale.append(self.quantizer.scale); zero.append(self.quantizer.zero)
-        scale = torch.cat(scale, dim=1).to(device=self.compute_device)
-        zero = torch.cat(zero, dim=1).to(device=self.compute_device)
-        
+        try:
+            scale = torch.cat(scale, dim=1).to(device=self.compute_device)
+            zero = torch.cat(zero, dim=1).to(device=self.compute_device)
+        except Exception as e:
+             log.error(f"Error concatenating scale/zero {self.name}: {e}")
+             scale = self.quantizer.scale.to(device=self.compute_device)
+             zero = self.quantizer.zero.to(device=self.compute_device)
+
         duration = time.time() - start
         log.info(f"Finished quantization for {self.name} in {duration:.2f} seconds. Final damp: {damp:.5f}")
         return Q, scale, zero, g_idx, duration, avg_loss, damp, self.nsamples
 
     def free(self):
         log.debug(f"Freeing resources for GPTQ layer {self.name}")
-        for attr in ["H", "A", "W_orig", "quantizer", "module", "W_ref", "fwd_inputs_buffered_data", "named_module"]:
+        for attr in ["H", "A", "W_orig", "quantizer", "module", "W_ref", "fwd_inputs_buffered_data", "module_copy"]:
             if hasattr(self, attr): delattr(self, attr)
+        if 'fwd_inputs_buffered_data' not in locals() and hasattr(self, 'fwd_inputs_buffered_data'): self.fwd_inputs_buffered_data.clear()
 
 __all__ = ["GPTQ"]
