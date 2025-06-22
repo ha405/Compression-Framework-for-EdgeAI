@@ -14,8 +14,8 @@ except ImportError:
 
 
 from ..base import BaseGPTQModel
-from ...utils.data import collate_data
-from ...utils.model import MODALITY
+# Make sure this import is correct for your project structure
+from ...utils.model import MODALITY, get_module
 
 
 class ResNet50GPTQ(BaseGPTQModel):
@@ -43,16 +43,25 @@ class ResNet50GPTQ(BaseGPTQModel):
 
     def get_layers(self, model: nn.Module) -> List[Tuple[str, nn.Module]]:
         """
-        Overrides the default layer-finding mechanism to correctly handle the
-        ResNet architecture by collecting blocks AND THEIR NAMES from the model.
+        Corrected layer-finding mechanism.
+        This now returns ALL quantizable layers: the base modules (conv1, fc)
+        and all the bottleneck blocks from the main stages.
         """
-        named_blocks = []
+        all_quantizable_layers = []
+
+        # 1. Add the standalone base layers (conv1, fc)
+        for name in self.base_modules:
+            module = get_module(model, name)
+            if module:
+                all_quantizable_layers.append((name, module))
+
+        # 2. Add the blocks from the main stages (layer1, layer2, etc.)
         for stage_name in ["layer1", "layer2", "layer3", "layer4"]:
             stage = getattr(model, stage_name)
             for i, block in enumerate(stage):
-                named_blocks.append((f"{stage_name}.{i}", block))
+                all_quantizable_layers.append((f"{stage_name}.{i}", block))
         
-        return named_blocks
+        return all_quantizable_layers
 
     def prepare_dataset(
         self,
@@ -85,7 +94,8 @@ class ResNet50GPTQ(BaseGPTQModel):
         if isinstance(calibration_dataset, list):
             dataset = ImageDataset(calibration_dataset, image_transforms)
         elif isinstance(calibration_dataset, Dataset):
-            dataset = ImageDataset(calibration_dataset, image_transforms)
+            # This assumes the dataset yields PIL Images
+            dataset = ImageDataset([img for img in calibration_dataset], image_transforms)
         else:
             raise ValueError("calibration_dataset must be a list of PIL Images or a PyTorch Dataset.")
             
@@ -93,6 +103,7 @@ class ResNet50GPTQ(BaseGPTQModel):
         
         batched_data = []
         for batch in data_loader:
+            # The model expects the input tensor directly, not in a dict with key 'x'
             batched_data.append({'x': batch})
             
         return batched_data
