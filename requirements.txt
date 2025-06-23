@@ -1,35 +1,18 @@
 accelerate>=1.6.0
-auto_round==0.5.1
-clearml==1.18.0
-datasets>=3.5.0
-device-smi==0.4.1
-fast_hadamard_transform==1.0.4.post1
-fastapi==0.115.12
-hf_transfer>=0.1.9           # New
-huggingface_hub>=0.30.1
-intel_extension_for_pytorch==2.6.0
-lm_eval==0.4.8
-logbar==0.0.4
-mlx_lm==0.23.2
-modelscope==1.25.0
+# datasets>=3.5.0
 numpy>=1.26.4
-packaging==25.0             # Resolved (stricter ==)
-Pillow==11.2.1              # Resolved (stricter ==)
-protobuf>=5.29.3            # New
-pydantic==2.11.3
-pytablewriter==1.2.1
-random_word==1.0.13
-Requests==2.32.3
-sacrebleu==2.5.1
-safetensors==0.5.3          # Resolved (stricter ==)
-scikit_learn==1.4.2
-setuptools==75.1.0
-thefuzz==0.22.1
-threadpoolctl==3.6.0        # Resolved (stricter ==)
-tokenicer==0.0.4
-torch>=2.4.1                # New
-tqdm==4.66.5
+torch>=2.4.1
+safetensors>=0.5.3
 transformers>=4.51.2
-triton==3.3.0
-tvm==1.0.0
-uvicorn==0.34.2
+threadpoolctl>=3.6.0
+packaging>=24.2
+device-smi==0.4.1
+protobuf>=5.29.3
+pillow>=11.1.0
+hf_transfer>=0.1.9
+huggingface_hub>=0.30.1
+random_word==1.0.13
+tokenicer==0.0.4
+logbar==0.0.4
+# for Qwen-Omni model
+soundfile==0.13.1
