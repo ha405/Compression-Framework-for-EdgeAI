@@ -84,6 +84,7 @@ class GPTQ:
         self.qcfg = qcfg if qcfg else QuantizeConfig()
         if not hasattr(self.qcfg, 'beta'): self.qcfg.beta = 0.0
         if not hasattr(self.qcfg, 'tau'): self.qcfg.tau = 1.0
+        if not hasattr(self.qcfg, 'eta'):   self.qcfg.eta   = 0.0
         if not hasattr(self.qcfg, 'damp_percent'): self.qcfg.damp_percent = 0.01
         if not hasattr(self.qcfg, 'damp_auto_increment'): self.qcfg.damp_auto_increment = 0.0015
         if not hasattr(self.qcfg, 'gamma'): self.qcfg.gamma = 0.0
@@ -100,6 +101,7 @@ class GPTQ:
         self.H: Optional[torch.Tensor] = None
         self.A: Optional[torch.Tensor] = None
         self.B: Optional[torch.Tensor] = None
+        self.F: Optional[torch.Tensor] = None
         self.nsamples: int = 0
 
         if Quantizer is None: raise ImportError("Quantizer class not found.")
@@ -179,66 +181,80 @@ class GPTQ:
 
     def process_batch(self, inp: torch.Tensor):
         inp_compute = inp.to(device=self.compute_device, dtype=torch.float32)
-
-        original_shape = inp_compute.shape; reshaped_inp = None; source_module = self.module
-        if isinstance(source_module, (nn.Linear, transformers.Conv1D)):
-            if inp_compute.ndim > 2: reshaped_inp = inp_compute.reshape(-1, original_shape[-1])
-            else: reshaped_inp = inp_compute
-        elif isinstance(source_module, nn.Conv2d):
-            unfolded_inp = F.unfold(inp_compute, kernel_size=source_module.kernel_size, dilation=source_module.dilation, padding=source_module.padding, stride=source_module.stride)
-            reshaped_inp = unfolded_inp.permute(0, 2, 1).reshape(-1, unfolded_inp.shape[1])
+        original_shape = inp_compute.shape
+        if isinstance(self.module, (nn.Linear, Conv1D)):
+            reshaped_inp = inp_compute.reshape(-1, original_shape[-1]) if inp_compute.ndim > 2 else inp_compute
+        elif isinstance(self.module, nn.Conv2d):
+            unfolded = F.unfold(
+                inp_compute,
+                kernel_size=self.module.kernel_size,
+                dilation=self.module.dilation,
+                padding=self.module.padding,
+                stride=self.module.stride,
+            )
+            reshaped_inp = unfolded.permute(0, 2, 1).reshape(-1, unfolded.shape[1])
         else:
-            if hasattr(source_module, 'weight') and inp_compute.ndim > 2:
-                  try: reshaped_inp = inp_compute.reshape(-1, self.columns)
-                  except Exception as reshape_err: raise TypeError(f"Unsupported layer {type(source_module)}, fallback failed: {reshape_err}")
-            else: raise TypeError(f"Unsupported layer type for process_batch: {type(source_module)}")
+            if hasattr(self.module, "weight") and inp_compute.ndim > 2:
+                reshaped_inp = inp_compute.reshape(-1, self.columns)
+            else:
+                raise TypeError(f"Unsupported layer type for process_batch: {type(self.module)}")
 
-        if reshaped_inp is None or reshaped_inp.shape[1] != self.columns:
-            raise ValueError(f"Shape mismatch {self.name}: Input {original_shape} -> reshaped {reshaped_inp.shape if reshaped_inp is not None else 'None'}. Expected cols ({self.columns})")
+        if reshaped_inp.shape[1] != self.columns:
+            raise ValueError(
+                f"Shape mismatch {self.name}: got {reshaped_inp.shape[1]} cols, expected {self.columns}"
+            )
 
         batch_token_size = reshaped_inp.shape[0]
-        if batch_token_size == 0: return
+        if batch_token_size == 0:
+            return
 
         total_samples = self.nsamples + batch_token_size
-        if total_samples == 0: return
-
         beta_scale = float(self.nsamples) / total_samples
         alpha_scale = 2.0 / total_samples
 
-        if self.H is None: self.H = torch.zeros((self.columns, self.columns), dtype=torch.float32, device=self.compute_device)
+        # ---- Activation normalization ----
+        norms = reshaped_inp.norm(p=2, dim=1, keepdim=True)
+        reshaped_inp = reshaped_inp / (norms + 1e-6)
+        # -----------------------------------
+
+        # Accumulate input-space Hessian H
+        if self.H is None:
+            self.H = torch.zeros((self.columns, self.columns), dtype=torch.float32, device=self.compute_device)
         self.H.addmm_(reshaped_inp.T, reshaped_inp, beta=beta_scale, alpha=alpha_scale)
 
-        if self.qcfg.beta > 0:
-            if self.A is None: self.A = torch.zeros((self.columns, self.columns), dtype=torch.float32, device=self.compute_device)
-            output = reshaped_inp @ self.W_orig.T
-            if torch.isnan(output).any() or torch.isinf(output).any():
-                log.warning(f"NaN/Inf in pre-softmax output {self.name}. Clamping.")
-                output = torch.nan_to_num(output)
+        # Precompute logits and softmax if any curvature term is active
+        if self.qcfg.beta > 0 or self.qcfg.gamma > 0 or self.qcfg.eta > 0:
+            logits = reshaped_inp @ self.W_orig.T
             tau = max(self.qcfg.tau, 1e-6)
-            try:
-                pt = F.softmax(output / tau, dim=-1)
-                if torch.isnan(pt).any(): raise ValueError("NaN detected in softmax output")
-                kl_weights = torch.sum(pt * (1.0 - pt), dim=-1)
-                kl_weights = torch.clamp(kl_weights, min=0.0)
-            except ValueError:
-                log.warning(f"Could not compute valid softmax/KL weights {self.name}. Using zero weights.")
-                kl_weights = torch.zeros(batch_token_size, device=self.compute_device, dtype=torch.float32)
-            weighted_inp = reshaped_inp * torch.sqrt(kl_weights).unsqueeze(1)
-            self.A.addmm_(weighted_inp.T, weighted_inp, beta=beta_scale, alpha=alpha_scale)
-        
-            if self.qcfg.gamma > 0:
-                if self.B is None:
-                    self.B = torch.zeros((self.columns, self.columns),
-                                        dtype=torch.float32, device=self.compute_device)
-                qt = F.softmax(output / tau, dim=-1)
-                ce_weights = torch.sum(qt * (1.0 - qt), dim=-1).clamp(min=0.0)
-                weighted_inp_ce = reshaped_inp * torch.sqrt(ce_weights).unsqueeze(1)
-                self.B.addmm_(weighted_inp_ce.T,
-                            weighted_inp_ce,
-                            beta=beta_scale,
-                            alpha=alpha_scale)
+            p = F.softmax(logits / tau, dim=-1).clamp(0, 1)
 
-        self.nsamples += batch_token_size
+        # KL Fisher curvature (A)
+        if self.qcfg.beta > 0:
+            if self.A is None:
+                self.A = torch.zeros_like(self.H)
+            kl_weights = (p * (1 - p)).sum(dim=1).clamp(min=0.0).sqrt().unsqueeze(1)
+            weighted_inp = reshaped_inp * kl_weights
+            self.A.addmm_(weighted_inp.T, weighted_inp, beta=beta_scale, alpha=alpha_scale)
+
+        # CE entropy curvature (B)
+        if self.qcfg.gamma > 0:
+            if self.B is None:
+                self.B = torch.zeros_like(self.H)
+            ce_weights = (p * (1 - p)).sum(dim=1).clamp(min=0.0).sqrt().unsqueeze(1)
+            weighted_inp_ce = reshaped_inp * ce_weights
+            self.B.addmm_(weighted_inp_ce.T, weighted_inp_ce, beta=beta_scale, alpha=alpha_scale)
+
+        # Weight-space Fisher curvature (F)
+        if self.qcfg.eta > 0:
+            if self.F is None:
+                self.F = torch.zeros_like(self.H)
+            y_hat = torch.argmax(p, dim=1)
+            one_hot = F.one_hot(y_hat, num_classes=p.size(1)).float()
+            grad_factor = (one_hot - p).abs().sum(dim=1).clamp(min=0.0).sqrt().unsqueeze(1)
+            weighted_inp_w = reshaped_inp * grad_factor
+            self.F.addmm_(weighted_inp_w.T, weighted_inp_w, beta=beta_scale, alpha=alpha_scale)
+
+        self.nsamples = total_samples
 
     def hf_quantize(self, blocksize=128, percdamp=0.01, damp_auto_increment=0.0015, group_size=-1, actorder=False, static_groups=False):
         self.qcfg.group_size = group_size; self.qcfg.damp_percent = percdamp; self.qcfg.damp_auto_increment = damp_auto_increment;
@@ -291,15 +307,21 @@ class GPTQ:
         if self.nsamples == 0: raise ValueError(f"No samples collected {self.name}")
         if self.H is None: raise RuntimeError(f"Hessian is None {self.name}")
         H_tot = self.H
+        trH = torch.trace(H_tot)
         if self.qcfg.beta > 0 and self.A is not None:
-            # log.debug(f"Adding KL Hessian with beta={self.qcfg.beta}")
-            H_tot = H_tot + self.qcfg.beta * self.A
+            trA = torch.trace(self.A)
+            H_tot = H_tot + self.qcfg.beta * self.A * (trH / (trA + 1e-6 * trH))
         if self.qcfg.gamma > 0 and hasattr(self, 'B') and self.B is not None:
-            # log.debug(f"Adding CE Hessian with gamma={self.qcfg.gamma}")
-            H_tot = H_tot + self.qcfg.gamma * self.B
+            trB = torch.trace(self.B)
+            H_tot = H_tot + self.qcfg.gamma * self.B * (trH / (trB + 1e-6 * trH))
+        if self.qcfg.eta > 0 and self.F is not None:
+            trF = torch.trace(self.F)
+            H_tot = H_tot + self.qcfg.eta * self.F * (trH / (trF + 1e-6 * trH))
+
         del self.H; self.H = None
         if hasattr(self, 'A'): del self.A; self.A = None
         if hasattr(self, 'B'): del self.B; self.B = None
+        if hasattr(self, 'F'): del self.F; self.F = None
 
         W = self.W_orig.clone()
         del self.W_orig; self.W_orig = None
