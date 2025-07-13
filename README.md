@@ -1,5 +1,3 @@
-Based on the codebase context, you're asking me to write a short README for the **KLAWQ: KL-Aware Weight Quantization** framework in the `ha405/Compression-Framework-for-EdgeAI` repository. 
-
 # KLAWQ: KL-Aware Weight Quantization for Edge AI
 
 A novel post-training quantization framework that enhances GPTQ by integrating KL divergence for better accuracy preservation when deploying Large Language Models on edge devices. [1](#0-0) 
