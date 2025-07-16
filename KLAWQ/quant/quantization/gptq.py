@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
+from tqdm import tqdm
+from collections import defaultdict
 
 try:
     from transformers.pytorch_utils import Conv1D
@@ -110,6 +112,9 @@ class GPTQ:
         self.fwd_inputs_buffered = False
         self.fwd_inputs_buffered_data = []
         self.fwd_counter = 0
+        module._gptq = self
+        self.Hinv = None
+        self.H_tot = None
 
     @staticmethod
     def _validate_module(module):
@@ -212,10 +217,10 @@ class GPTQ:
         beta_scale = float(self.nsamples) / total_samples
         alpha_scale = 2.0 / total_samples
 
-        # ---- Activation normalization ----
-        norms = reshaped_inp.norm(p=2, dim=1, keepdim=True)
-        reshaped_inp = reshaped_inp / (norms + 1e-6)
-        # -----------------------------------
+        # # ---- Activation normalization ----
+        # norms = reshaped_inp.norm(p=2, dim=1, keepdim=True)
+        # reshaped_inp = reshaped_inp / (norms + 1e-6)
+        # # -----------------------------------
 
         # Accumulate input-space Hessian H
         if self.H is None:
@@ -309,26 +314,44 @@ class GPTQ:
         H_tot = self.H
         trH = torch.trace(H_tot)
         if self.qcfg.beta > 0 and self.A is not None:
-            trA = torch.trace(self.A)
-            H_tot = H_tot + self.qcfg.beta * self.A * (trH / (trA + 1e-6 * trH))
+            # trA = torch.trace(self.A)
+            H_tot = H_tot + self.qcfg.beta * self.A
         if self.qcfg.gamma > 0 and hasattr(self, 'B') and self.B is not None:
-            trB = torch.trace(self.B)
-            H_tot = H_tot + self.qcfg.gamma * self.B * (trH / (trB + 1e-6 * trH))
+            # trB = torch.trace(self.B)
+            H_tot = H_tot + self.qcfg.gamma * self.B
         if self.qcfg.eta > 0 and self.F is not None:
-            trF = torch.trace(self.F)
-            H_tot = H_tot + self.qcfg.eta * self.F * (trH / (trF + 1e-6 * trH))
+            # trF = torch.trace(self.F)
+            H_tot = H_tot + self.qcfg.eta * self.F
+        
+        eps = 1e-6 * torch.trace(H_tot)
+        sH = torch.trace(H_tot)
+        if self.qcfg.beta > 0 and self.A is not None:
+            sA = torch.trace(self.A)
+            beta_eff = self.qcfg.beta * (sH / (sA + eps))
+            H_tot = H_tot + beta_eff * self.A
 
-        del self.H; self.H = None
-        if hasattr(self, 'A'): del self.A; self.A = None
-        if hasattr(self, 'B'): del self.B; self.B = None
-        if hasattr(self, 'F'): del self.F; self.F = None
+        if self.qcfg.gamma > 0 and self.B is not None:
+            sB = torch.trace(self.B)
+            gamma_eff = self.qcfg.gamma * (sH / (sB + eps))
+            H_tot = H_tot + gamma_eff * self.B
+
+        if self.qcfg.eta > 0 and self.F is not None:
+            sF = torch.trace(self.F)
+            eta_eff = self.qcfg.eta * (sH / (sF + eps))
+            H_tot = H_tot + eta_eff * self.F
+
+        # del self.H; self.H = None
+        # if hasattr(self, 'A'): del self.A; self.A = None
+        # if hasattr(self, 'B'): del self.B; self.B = None
+        # if hasattr(self, 'F'): del self.F; self.F = None
 
         W = self.W_orig.clone()
-        del self.W_orig; self.W_orig = None
+        # del self.W_orig; self.W_orig = None
 
         self.quantizer.find_params(W, weight=True)
-
+        
         H = H_tot.clone(); del H_tot
+        self.H_tot = H
         dead = torch.diag(H) == 0
         H[dead, dead] = 1
         W[:, dead] = 0
@@ -351,7 +374,7 @@ class GPTQ:
             del diag_H; W = W[:, perm]; H = H[perm][:, perm]; invperm = torch.argsort(perm)
 
         Hinv, damp = self.hessian_inverse(H); del H
-
+        self.Hinv = Hinv
         Losses = torch.zeros_like(W); Q = torch.zeros_like(W)
 
         for i1 in range(0, self.columns, blocksize):
@@ -391,7 +414,7 @@ class GPTQ:
                  # *** DEBUG PRINTS REMOVED ***
                  W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
-
+        
         del Hinv, W1, Q1, Err1, Losses1
         torch_sync()
 
@@ -438,5 +461,105 @@ class GPTQ:
         for attr in ["H", "A", "W_orig", "quantizer", "module", "W_ref", "fwd_inputs_buffered_data", "module_copy"]:
             if hasattr(self, attr): delattr(self, attr)
         if 'fwd_inputs_buffered_data' not in locals() and hasattr(self, 'fwd_inputs_buffered_data'): self.fwd_inputs_buffered_data.clear()
+
+
+
+    @staticmethod
+    def meta_tune_model(model, val_loader, lr, device, epochs=10):
+        model.train()
+
+        for epoch in range(epochs):
+            batch = next(iter(val_loader))
+            batch = {k: v.to(device) for k, v in batch.items()}
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+
+            labels = input_ids.clone()
+            labels[:, :-1] = input_ids[:, 1:]
+            labels[:, -1] = -100
+
+            for param in model.parameters():
+                param.requires_grad = True
+
+            with torch.enable_grad():
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = outputs.logits[:, :-1, :].reshape(-1, outputs.logits.size(-1))
+                targets = labels[:, :-1].reshape(-1)
+                loss = F.cross_entropy(logits, targets, reduction="mean")
+
+            loss.backward()
+
+            gptq_modules = []
+            g_vals = []
+
+            for module in model.modules():
+                if hasattr(module, "_gptq") and module.weight.grad is not None:
+                    gptq_modules.append(module._gptq)
+                    g_vals.append(module.weight.grad.detach().clone())
+
+            if gptq_modules:
+                print(f"\nEpoch {epoch+1}/{epochs} — Meta-tuning {len(gptq_modules)} layers")
+                total_hypergrad = defaultdict(float)
+
+                for gptq, g_val in zip(gptq_modules, g_vals):
+                    hgrad = gptq.compute_hypergrad(g_val)
+                    for k, v in hgrad.items():
+                        total_hypergrad[k] += v
+
+                for k in total_hypergrad:
+                    total_hypergrad[k] /= len(gptq_modules)
+
+                shared_qcfg = gptq_modules[0].qcfg
+                β, γ, η = shared_qcfg.beta, shared_qcfg.gamma, shared_qcfg.eta
+
+                shared_qcfg.beta  = max(0.0, β - lr * total_hypergrad["beta"])
+                shared_qcfg.gamma = max(0.0, γ - lr * total_hypergrad["gamma"])
+                shared_qcfg.eta   = max(0.0, η - lr * total_hypergrad["eta"])
+
+                print(f"[meta_update] β: {β:.6f} → {shared_qcfg.beta:.6f}, "
+                    f"γ: {γ:.6f} → {shared_qcfg.gamma:.6f}, "
+                    f"η: {η:.6f} → {shared_qcfg.eta:.6f}")
+
+            for param in model.parameters():
+                if param.grad is not None:
+                    param.grad.zero_()
+
+    def compute_hypergrad(self, g_val: torch.Tensor) -> dict:
+        Q = self._clone_module_weight(self.compute_device)
+        delta = Q - self.W_orig
+        g_mat = g_val.to(self.compute_device).float().reshape(self.rows, self.columns)
+
+        def solve(v): return self.Hinv.matmul(v)
+
+        hypergrad = {}
+        for name, M in (("beta", self.A), ("gamma", self.B), ("eta", self.F)):
+            θ = getattr(self.qcfg, name)
+            if θ > 0 and M is not None:
+                total = 0.0
+                for r in range(self.rows):
+                    v_r = M.matmul(delta[r])
+                    u_r = solve(v_r)
+                    total -= (g_mat[r] @ u_r).item()
+                hypergrad[name] = total
+            else:
+                hypergrad[name] = 0.0
+
+        return hypergrad
+
+
+    def apply_meta_update(self, hypergrad: dict, lr: float):
+        β, γ, η = self.qcfg.beta, self.qcfg.gamma, self.qcfg.eta
+
+        self.qcfg.beta  = max(0.0, β - lr * hypergrad["beta"])
+        self.qcfg.gamma = max(0.0, γ - lr * hypergrad["gamma"])
+        self.qcfg.eta   = max(0.0, η - lr * hypergrad["eta"])
+
+        print(f"[meta_update] β: {β:.6f} → {self.qcfg.beta:.6f}, "
+            f"γ: {γ:.6f} → {self.qcfg.gamma:.6f}, "
+            f"η: {η:.6f} → {self.qcfg.eta:.6f}")
+
+
+
+
 
 __all__ = ["GPTQ"]

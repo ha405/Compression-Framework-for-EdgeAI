@@ -22,7 +22,7 @@ log = setup_logger()
 class GPTQProcessor(LoopProcessor):
     def __init__(self, tokenizer, qcfg: QuantizeConfig, calibration_dataset, prepare_dataset_func,
                  calibration_dataset_concat_size: Optional[int], batch_size: int,
-                 logger_board: str = "", require_fwd: bool = True, retain_w: bool = False):
+                 logger_board: str = "", require_fwd: bool = True, retain_w: bool = False, val_loader: Optional[torch.utils.data.DataLoader] = None):
 
         super().__init__(tokenizer=tokenizer, qcfg=qcfg, calibration_dataset=calibration_dataset,
                          calibration_dataset_concat_size=calibration_dataset_concat_size,
@@ -31,6 +31,7 @@ class GPTQProcessor(LoopProcessor):
 
         self.retain_w = retain_w
         self.avg_losses = []
+        self.val_loader = val_loader
 
     def log_plotly(self):
         task = self.logger_task
@@ -53,7 +54,8 @@ class GPTQProcessor(LoopProcessor):
         if self.qcfg.dynamic_get(layer_name=module.full_name) == False:
             return
 
-        qcfg_clone = copy.deepcopy(self.qcfg)
+        qcfg_clone = self.qcfg 
+        # qcfg_clone = copy.deepcopy(self.qcfg)
 
         if self.qcfg.dynamic is not None:
             qcfg_clone.bits = self.qcfg.dynamic_get(module.full_name, "bits", qcfg_clone.bits)
@@ -148,8 +150,8 @@ class GPTQProcessor(LoopProcessor):
             module.state.update({
                 "w": w,
             })
-
-        self.tasks[module.name].free()
+        if not self.qcfg.meta_tune:
+            self.tasks[module.name].free()
 
         wq = wq.to(device=DEVICE_0)
 
@@ -169,6 +171,14 @@ class GPTQProcessor(LoopProcessor):
     def finalize(self, model: BaseGPTQModel, **kwargs):
         if self.stream:
             torch_sync()
+        
+        if self.qcfg.meta_tune:
+            log.info("Meta tuning model!")
+            device = next(model.parameters()).device
+            GPTQ.meta_tune_model(model, self.val_loader, lr=self.qcfg.meta_lr, device=device)
+        
+        for g in self.tasks.values():
+            g.free()
 
         backend = kwargs.pop("backend")
         model.qlinear_kernel = pack_model(

@@ -264,6 +264,7 @@ class BaseGPTQModel(nn.Module):
         logger_board: Optional[str] = None,
         buffered_fwd: bool = False,
         auto_gc: bool = True,
+        val_loader: Optional[torch.utils.data.DataLoader] = None,
     ) -> Dict[str, List[Dict[str, str]]]:
         if self.quantized:
             raise EnvironmentError("quantize() is called a model that is already quantized")
@@ -308,6 +309,7 @@ class BaseGPTQModel(nn.Module):
             "calibration_dataset_concat_size": calibration_dataset_concat_size,
             "batch_size": batch_size,
             "logger_board": logger_board,
+            "val_loader": val_loader,
         }
 
         processors = [GPTQProcessor(**args)]

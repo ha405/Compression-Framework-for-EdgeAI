@@ -350,9 +350,10 @@ class PackableQuantLinear(BaseQuantLinear):
             self.wf_unsqueeze_zero,
             self.wf_unsqueeze_neg_one,
         ]
-
     def dequantize_weight(self, num_itr: int = 1):
         if self.bits in [2, 4, 8]:
+            # if not hasattr(self, 'wf_unsqueeze_zero'):
+            #    self.wf_unsqueeze_zero = t.tensor(0, device=self.qzeros.device)
             zeros = t.bitwise_right_shift(
                 t.unsqueeze(self.qzeros, 2).expand(-1, -1, self.pack_factor),
                 self.wf_unsqueeze_zero
